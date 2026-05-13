@@ -1,3 +1,4 @@
+import idaapi
 import os
 
 import ida_bytes
@@ -6,7 +7,9 @@ import ida_funcs
 import ida_hexrays
 import ida_idaapi
 import ida_kernwin
+import ida_lines
 import ida_loader
+import ida_name
 import ida_range
 import idautils
 
@@ -345,6 +348,100 @@ class AssemportUIHooks(ida_kernwin.UI_Hooks):
                         None,
                     )
 
+def get_loose_code_block_range(ea):
+    end_ea = ea
+    while True:
+        refs = [ref for ref in idautils.CodeRefsFrom(end_ea, True)]
+        end_ea = ida_bytes.get_item_end(end_ea)
+        if len(refs)==0:
+            break
+        curr_flags = ida_bytes.get_flags(end_ea)
+        if not ida_bytes.is_code(curr_flags):
+            break
+        if end_ea == idaapi.BADADDR or ida_funcs.get_func(end_ea) or ida_funcs.get_fchunk(end_ea):
+            break
+    return ida_range.range_t(ea, end_ea)
+
+def unhide_func_and_export_asm(func: ida_funcs.func_t, file):
+    """Temporarily unhide function and its chunks, then export to ASM"""
+    hidden_funcs = []
+    if func.flags & ida_funcs.FUNC_HIDDEN:
+        hidden_funcs.append(func)
+        func.flags &= ~ida_funcs.FUNC_HIDDEN
+        ida_funcs.update_func(func)
+    try:
+        ranges = ida_range.rangeset_t()
+        ida_funcs.get_func_ranges(ranges, func)
+
+        # Sort ranges: body (starting at func.start_ea) first, then others by address
+        all_ranges = [ranges.getrange(i) for i in range(ranges.nranges())]
+        all_ranges.sort(
+            key=lambda r: (0 if r.start_ea == func.start_ea else 1, r.start_ea)
+        )
+
+        while len(all_ranges) > 0:
+            r = all_ranges.pop(0)
+            start, end = r.start_ea, r.end_ea
+            # Robust lookup: find all hidden ranges overlapping this chunk
+            hidden_to_restore = []
+            curr_ea = start
+            hidden_funcs = []
+            while curr_ea < end:
+                hr = ida_bytes.get_hidden_range(curr_ea)
+                if not hr:
+                    hr = ida_bytes.get_next_hidden_range(curr_ea)
+                    if not hr or hr.start_ea >= end:
+                        break
+
+                # We found a hidden range overlapping [curr_ea, end)
+                # Store it and delete it
+                hidden_to_restore.append(
+                    (
+                        hr.start_ea,
+                        hr.end_ea,
+                        hr.description,
+                        hr.header,
+                        hr.footer,
+                        hr.color,
+                    )
+                )
+                ida_bytes.del_hidden_range(hr.start_ea)
+                curr_ea = hr.end_ea  # Move to end of deleted range
+            f = ida_funcs.get_func(start)
+            if f and f.start_ea != func.start_ea and f.flags & ida_funcs.FUNC_HIDDEN:
+                hidden_funcs.append(f)
+                f.flags &= ~ida_funcs.FUNC_HIDDEN
+                ida_funcs.update_func(f)
+            try:
+                if start >= func.start_ea and end <= func.end_ea:
+                    ida_loader.gen_file(
+                        ida_loader.OFILE_ASM, file.get_fp(), start, end, 0
+                    )
+                else:
+                    r_name = ida_name.get_name(start)
+                    ida_fpro._ida_fpro.qfile_t_write(file, f"{r_name}\n")  # ty:ignore[unresolved-attribute]
+                    for head in idautils.Heads(start, end):
+                        disasm = ida_lines.generate_disasm_line(head, 0)
+                        ida_fpro._ida_fpro.qfile_t_write(  # ty:ignore[unresolved-attribute]
+                            file, f"{ida_lines.tag_remove(disasm)}\n"
+                        )
+                        for ref in idautils.CodeRefsFrom(head, False):
+                            called_func = ida_funcs.get_func(ref)
+                            if called_func and called_func.start_ea != func.start_ea:
+                                export_recursive_functions(called_func.start_ea, "asm")
+                            elif not called_func and (ref < start or ref >= end):
+                                all_ranges.append(get_loose_code_block_range(ref))
+                    ida_fpro._ida_fpro.qfile_t_write(file, "\n")  # ty:ignore[unresolved-attribute]
+
+            finally:
+                for hr_data in hidden_to_restore:
+                    ida_bytes.add_hidden_range(*hr_data)
+
+    finally:
+        for f in hidden_funcs:
+            func.flags |= ida_funcs.FUNC_HIDDEN
+            ida_funcs.update_func(func)
+
 
 def export_single_function(func):
     """Export a single function to assembly file"""
@@ -370,26 +467,18 @@ def export_single_function(func):
         # Get function name
         func_name = ida_funcs.get_func_name(func.start_ea)
 
-        # Get function ranges
-        ranges = ida_range.rangeset_t()
-        if ida_funcs.get_func_ranges(ranges, func) == ida_idaapi.BADADDR:
-            print(f"[Assemport] Bad Range for function {func_name}")
-            return
-
-        start = ranges.begin().start_ea
-        end = ranges.begin().end_ea
-
         # Save Content
         file = ida_fpro.qfile_t()
         filename = os.path.join(output, f"{func_name}.asm")
 
         if file.open(filename, "wt"):
             try:
-                ida_loader.gen_file(ida_loader.OFILE_ASM, file.get_fp(), start, end, 0)
+                unhide_func_and_export_asm(func, file)
                 print(f"[Assemport] Exported function {func_name} to {filename}")
                 ida_kernwin.info(f"Function {func_name} exported successfully!")
             finally:
                 file.close()
+
         else:
             print(f"[Assemport] Failed to create file {filename}")
 
@@ -434,33 +523,16 @@ def export_selected_functions(selection_indices):
                 # Get function name
                 func_name = ida_funcs.get_func_name(ea)
 
-                # Get function ranges
-                ranges = ida_range.rangeset_t()
-                if ida_funcs.get_func_ranges(ranges, func) == ida_idaapi.BADADDR:
-                    print(f"[Assemport] Bad Range for function {func_name}")
-                    continue
-
-                start = ranges.begin().start_ea
-                end = ranges.begin().end_ea
-
                 # Save Content
                 file = ida_fpro.qfile_t()
                 filename = os.path.join(output, f"{func_name}.asm")
 
                 if file.open(filename, "wt"):
                     try:
-                        ida_loader.gen_file(
-                            ida_loader.OFILE_ASM, file.get_fp(), start, end, 0
-                        )
-                        print(
-                            f"[Assemport] Exported function {func_name} to {filename}"
-                        )
+                        unhide_func_and_export_asm(func, file.get_fp())
                         exported_count += 1
                     finally:
                         file.close()
-                else:
-                    print(f"[Assemport] Failed to create file {filename}")
-
         ida_kernwin.info(f"Exported {exported_count} functions successfully!")
 
     finally:
@@ -559,9 +631,9 @@ def get_recursive_functions(start_ea):
     return to_export
 
 
-def export_recursive_functions(start_ea, mode="asm"):
+def export_recursive_functions(start_ea, mode="asm",heuristic=False):
     """Export a function and all its sub-calls recursively"""
-    ida_kernwin.show_wait_box("Analyzing recursive calls...")
+    ida_kernwin.show_wait_box(f"{'heuristic ' if heuristic else ''}analyzing recursive calls...")
 
     try:
         functions_to_export = get_recursive_functions(start_ea)
@@ -571,7 +643,7 @@ def export_recursive_functions(start_ea, mode="asm"):
             ida_kernwin.warning("No functions found to export")
             return
 
-        ida_kernwin.replace_wait_box(f"Exporting {total} functions...")
+        ida_kernwin.replace_wait_box(f"{'heuristic ' if heuristic else ''}exporting {total} functions...")
 
         # Get Working-Path
         path = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_CMD))
@@ -592,30 +664,20 @@ def export_recursive_functions(start_ea, mode="asm"):
             func = ida_funcs.get_func(ea)
             func_name = ida_funcs.get_func_name(ea)
 
-            ida_kernwin.replace_wait_box(f"Exporting {i + 1}/{total}: {func_name}")
+            ida_kernwin.replace_wait_box(f"{'heuristic ' if heuristic else ''}exporting {i + 1}/{total}: {func_name}")
 
             if mode == "asm":
-                # Get function ranges
-                ranges = ida_range.rangeset_t()
-                if ida_funcs.get_func_ranges(ranges, func) == ida_idaapi.BADADDR:
-                    continue
-
-                start = ranges.begin().start_ea
-                end = ranges.begin().end_ea
-
                 # Save Content
                 file = ida_fpro.qfile_t()
                 filename = os.path.join(output, f"{func_name}.asm")
 
                 if file.open(filename, "wt"):
                     try:
-                        ida_loader.gen_file(
-                            ida_loader.OFILE_ASM, file.get_fp(), start, end, 0
-                        )
+                        assert isinstance(func, ida_funcs.func_t)
+                        unhide_func_and_export_asm(func, file)
                         exported_count += 1
                     finally:
                         file.close()
-
             elif mode == "c":
                 if not ida_hexrays.init_hexrays_plugin():
                     continue
@@ -632,7 +694,7 @@ def export_recursive_functions(start_ea, mode="asm"):
                     pass
 
         ida_kernwin.info(
-            f"Recursively exported {exported_count} functions successfully!"
+            f"{'heuristic ' if heuristic else ''}recursively exported {exported_count} functions successfully!"
         )
 
     finally:
@@ -833,14 +895,6 @@ def export_selected_functions_combined(selection_indices, file_type):
 def export_function_assembly(func, ea):
     """Helper function to get assembly code for a function"""
     try:
-        # Get function ranges
-        ranges = ida_range.rangeset_t()
-        if ida_funcs.get_func_ranges(ranges, func) == ida_idaapi.BADADDR:
-            return None
-
-        start = ranges.begin().start_ea
-        end = ranges.begin().end_ea
-
         # Create a temporary file to capture assembly output
         import tempfile
 
@@ -853,7 +907,7 @@ def export_function_assembly(func, ea):
         file = ida_fpro.qfile_t()
         if file.open(temp_filename, "wt"):
             try:
-                ida_loader.gen_file(ida_loader.OFILE_ASM, file.get_fp(), start, end, 0)
+                unhide_func_and_export_asm(func, file.get_fp())
             finally:
                 file.close()
 
@@ -1045,22 +1099,15 @@ class Assemport(ida_idaapi.plugmod_t):
                 func_name = ida_funcs.get_func_name(ea)
 
                 # Get Info
-                range = ida_range.rangeset_t()
-                if ida_funcs.get_func_ranges(range, func) == ida_idaapi.BADADDR:
-                    print("[Assemport] Bad Range, Skipping 0x%x" % ea)
-                    continue
-
-                start = range.begin().start_ea
-                end = range.begin().end_ea
+                ranges = ida_range.rangeset_t()
+                ida_funcs.get_func_ranges(ranges, func)
 
                 # Save Assembly Content
                 file = ida_fpro.qfile_t()
 
                 if file.open(os.path.join(output, "%s.asm" % func_name), "wt"):
                     try:
-                        ida_loader.gen_file(
-                            ida_loader.OFILE_ASM, file.get_fp(), start, end, 0
-                        )
+                        unhide_func_and_export_asm(func, file.get_fp())
                     finally:
                         file.close()
 
