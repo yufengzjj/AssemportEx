@@ -272,29 +272,62 @@ class AssemportUIHooks(ida_kernwin.UI_Hooks):
 def get_loose_code_block_range(ea):
     end_ea = ea
     while True:
-        refs = [ref for ref in idautils.CodeRefsFrom(end_ea, True)]
-        end_ea = ida_bytes.get_item_end(end_ea)
-        if len(refs) == 0:
-            break
         curr_flags = ida_bytes.get_flags(end_ea)
-        if not ida_bytes.is_code(curr_flags):
+        if end_ea == idaapi.BADADDR or not ida_bytes.is_code(curr_flags):
             break
-        if end_ea == idaapi.BADADDR or ida_funcs.get_func(end_ea) or ida_funcs.get_fchunk(end_ea):
+        refs = [ref for ref in idautils.CodeRefsFrom(end_ea, True)]
+        if len(refs) == 0:
+            end_ea = ida_bytes.get_item_end(end_ea)
             break
+        refs = [ref for ref in idautils.CodeRefsFrom(end_ea, False)]
+        if len(refs) > 0:
+            end_ea = ida_bytes.get_item_end(end_ea)
+            break
+        cur_func = ida_funcs.get_func(end_ea)
+        if cur_func:
+            if cur_func.start_ea <= end_ea < cur_func.end_ea:
+                end_ea = cur_func.end_ea
+                break
+            if cur_func.start_ea == end_ea:
+                break
+        cur_fchunk = ida_funcs.get_fchunk(end_ea)
+        if cur_fchunk:
+            if cur_fchunk.start_ea <= end_ea < cur_fchunk.end_ea:
+                end_ea = cur_fchunk.end_ea
+                break
+            if cur_fchunk.start_ea == end_ea:
+                break
+        end_ea = ida_bytes.get_item_end(end_ea)
     return ida_range.range_t(ea, end_ea)
 
 
-def check_ref_range(ranges: list, addr: int, cur_range: tuple[int, int], cur_func: ida_funcs.func_t, funcs_to_export: list | None):
+def check_ref_range(
+    ranges: list, addr: int, cur_range: tuple[int, int], cur_func: ida_funcs.func_t, funcs_to_export: list | None, processed_ranges: set
+):
     for ref in idautils.CodeRefsFrom(addr, False):
+        if cur_range[0] <= ref < cur_range[1]:
+            continue
         called_func = ida_funcs.get_func(ref)
         if called_func and called_func.start_ea != cur_func.start_ea:
-            if funcs_to_export is not None:
-                funcs_to_export.extend(get_recursive_functions(called_func.start_ea, False))
-        elif not called_func and (ref < cur_range[0] or ref >= cur_range[1]):
-            ranges.append(get_loose_code_block_range(ref))
+            if ref == called_func.start_ea:
+                if funcs_to_export is not None:
+                    funcs_to_export.extend(get_recursive_functions(called_func.start_ea, False))
+            else:
+                if called_func.start_ea <= ref < called_func.end_ea:
+                    r = ida_range.range_t(ref, called_func.end_ea)
+                    if (ref, called_func.end_ea) not in processed_ranges and r not in ranges:
+                        ranges.append(r)
+                else:
+                    r = get_loose_code_block_range(ref)
+                    if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+                        ranges.append(r)
+        elif not called_func:
+            r = get_loose_code_block_range(ref)
+            if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+                ranges.append(r)
 
 
-def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: list | None = None):
+def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: list | None = None, processed_ranges: set | None = None):
     """Temporarily unhide function and its chunks, then export to ASM"""
     hidden_funcs = []
     if func.flags & ida_funcs.FUNC_HIDDEN:
@@ -308,7 +341,7 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
         # Sort ranges: body (starting at func.start_ea) first, then others by address
         all_ranges = [ranges.getrange(i) for i in range(ranges.nranges())]
         all_ranges.sort(key=lambda r: (0 if r.start_ea == func.start_ea else 1, r.start_ea))
-
+        processed_ranges = set() if processed_ranges is None else processed_ranges
         while len(all_ranges) > 0:
             r = all_ranges.pop(0)
             start, end = r.start_ea, r.end_ea
@@ -344,16 +377,16 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
             try:
                 if start >= func.start_ea and end <= func.end_ea:
                     ida_loader.gen_file(ida_loader.OFILE_ASM, file.get_fp(), start, end, 0)
-                    check_ref_range(all_ranges, ida_bytes.prev_head(end, start), (start, end), func, funcs_to_export)
+                    check_ref_range(all_ranges, ida_bytes.prev_head(end, start), (start, end), func, funcs_to_export, processed_ranges)
                 else:
                     r_name = ida_name.get_name(start)
                     ida_fpro._ida_fpro.qfile_t_write(file, f"{r_name}\n")  # ty:ignore[unresolved-attribute]
                     for head in idautils.Heads(start, end):
                         disasm = ida_lines.generate_disasm_line(head, 0)
                         ida_fpro._ida_fpro.qfile_t_write(file, f"{ida_lines.tag_remove(disasm)}\n")  # ty:ignore[unresolved-attribute]
-                        check_ref_range(all_ranges, head, (start, end), func, funcs_to_export)
+                        check_ref_range(all_ranges, head, (start, end), func, funcs_to_export, processed_ranges)
                     ida_fpro._ida_fpro.qfile_t_write(file, "\n")  # ty:ignore[unresolved-attribute]
-
+                processed_ranges.add((start, end))
             finally:
                 for hr_data in hidden_to_restore:
                     ida_bytes.add_hidden_range(*hr_data)
@@ -517,6 +550,7 @@ def export_single_function_pseudocode(func):
 # Persistent settings using IDA netnode
 SETTINGS_NODE_NAME = "$ assemport_settings"
 SKIP_NAMED_TAG = "S"
+DEDUPE_ASM_TAG = "D"
 
 
 def get_skip_named_setting():
@@ -533,6 +567,22 @@ def set_skip_named_setting(value):
     node = idaapi.netnode(SETTINGS_NODE_NAME)
     node.create(SETTINGS_NODE_NAME)
     node.hashset(SKIP_NAMED_TAG, b"\x01" if value else b"\x00")
+
+
+def get_dedupe_asm_setting():
+    """Retrieve the 'dedupe ASM fragments' setting from the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)
+    if node.hashval(DEDUPE_ASM_TAG):
+        val = node.hashval(DEDUPE_ASM_TAG)
+        return val == b"\x01"
+    return True
+
+
+def set_dedupe_asm_setting(value):
+    """Store the 'dedupe ASM fragments' setting in the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)
+    node.create(SETTINGS_NODE_NAME)
+    node.hashset(DEDUPE_ASM_TAG, b"\x01" if value else b"\x00")
 
 
 def get_recursive_functions(start_ea, initial=True) -> list:
@@ -608,6 +658,8 @@ def export_recursive_functions(start_ea, mode="asm"):
         exported_count = 0
         i = 0
         processed = set()
+        global_processed_ranges = set() if get_dedupe_asm_setting() else None
+
         while len(functions_to_export) > 0:
             i += 1
             ea = functions_to_export.pop(0)
@@ -628,7 +680,7 @@ def export_recursive_functions(start_ea, mode="asm"):
                 if file.open(filename, "wt"):
                     try:
                         assert isinstance(func, ida_funcs.func_t)
-                        unhide_func_and_export_asm(func, file, functions_to_export)
+                        unhide_func_and_export_asm(func, file, functions_to_export, global_processed_ranges)
                         processed.add(func.start_ea)
                         exported_count += 1
                     finally:
@@ -771,14 +823,18 @@ ui_hooks = None
 
 
 class AssemportSettingsForm(ida_kernwin.Form):
-    def __init__(self, skip_named):
+    def __init__(self, skip_named, dedupe_asm):
         form_str = r"""STARTITEM 0
 Assemport Settings
 
-<Skip Named Functions:{rSkipNamedFunctions}>{cGroup}>
+<Skip Named Functions:{rSkipNamedFunctions}>
+<Global ASM Fragment Deduplication:{rDedupeAsm}>{cGroup}>
 """
         controls = {
-            "cGroup": ida_kernwin.Form.ChkGroupControl(["rSkipNamedFunctions"], value=1 if skip_named else 0),
+            "cGroup": ida_kernwin.Form.ChkGroupControl(
+                ["rSkipNamedFunctions", "rDedupeAsm"],
+                value=(1 if skip_named else 0) | (2 if dedupe_asm else 0),
+            ),
         }
         ida_kernwin.Form.__init__(self, form_str, controls)
 
@@ -887,12 +943,14 @@ class Assemport(ida_idaapi.plugmod_t):
             ui_hooks = None
 
     def run(self, arg):
-        current_val = get_skip_named_setting()
-        f = AssemportSettingsForm(current_val)
+        skip_named = get_skip_named_setting()
+        dedupe_asm = get_dedupe_asm_setting()
+        f = AssemportSettingsForm(skip_named, dedupe_asm)
         f.Compile()
         if f.Execute() == 1:
-            new_val = (f.cGroup.value & 1) != 0
-            set_skip_named_setting(new_val)
-            status = "ENABLED" if new_val else "DISABLED"
-            print(f"[Assemport] Skip Named Functions is now {status}")
+            new_skip_named = (f.cGroup.value & 1) != 0
+            new_dedupe_asm = (f.cGroup.value & 2) != 0
+            set_skip_named_setting(new_skip_named)
+            set_dedupe_asm_setting(new_dedupe_asm)
+            print(f"[Assemport] Settings updated: Skip Named={new_skip_named}, Dedupe ASM={new_dedupe_asm}")
         f.Free()
