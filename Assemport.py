@@ -48,13 +48,35 @@ class ExportSingleFunctionHandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE if func else ida_kernwin.AST_DISABLE
 
 
+def is_functions_window(ctx):
+    """Check if the context is from the Functions window (handles IDA 9.0 BWN_CHOOSER)"""
+    if not ctx:
+        return False
+
+    widget_type = getattr(ctx, "widget_type", -1)
+    widget_title = ""
+    if hasattr(ctx, "widget"):
+        widget_title = ida_kernwin.get_widget_title(ctx.widget)
+
+    # Debug: Uncomment to see all widget types/titles
+    # print(f"[Assemport] is_functions_window: type={widget_type}, title='{widget_title}'")
+
+    if widget_type == ida_kernwin.BWN_FUNCS:
+        return True
+    if widget_type == ida_kernwin.BWN_CHOOSER:
+        # IDA 9.0 Functions window is often a chooser with "Functions" in title
+        if "Functions" in widget_title:
+            return True
+    return False
+
+
 class ExportSelectedFunctionsHandler(ida_kernwin.action_handler_t):
     def __init__(self):
         ida_kernwin.action_handler_t.__init__(self)
 
     def activate(self, ctx):
         # Get selected functions from Functions window if it's active
-        if hasattr(ctx, "widget_type") and ctx.widget_type == ida_kernwin.BWN_FUNCS:
+        if is_functions_window(ctx):
             # Get selection from the Functions window
             selection = ctx.chooser_selection if hasattr(ctx, "chooser_selection") else []
             if not selection:
@@ -69,7 +91,7 @@ class ExportSelectedFunctionsHandler(ida_kernwin.action_handler_t):
 
     def update(self, ctx):
         # Enable only in Functions window with selection
-        if hasattr(ctx, "widget_type") and ctx.widget_type == ida_kernwin.BWN_FUNCS:
+        if is_functions_window(ctx):
             return ida_kernwin.AST_ENABLE if hasattr(ctx, "chooser_selection") and ctx.chooser_selection else ida_kernwin.AST_DISABLE
         return ida_kernwin.AST_DISABLE
 
@@ -112,7 +134,7 @@ class ExportSelectedFunctionsPseudocodeHandler(ida_kernwin.action_handler_t):
 
     def activate(self, ctx):
         # Get selected functions from Functions window if it's active
-        if hasattr(ctx, "widget_type") and ctx.widget_type == ida_kernwin.BWN_FUNCS:
+        if is_functions_window(ctx):
             # Get selection from the Functions window
             selection = ctx.chooser_selection if hasattr(ctx, "chooser_selection") else []
             if not selection:
@@ -127,61 +149,7 @@ class ExportSelectedFunctionsPseudocodeHandler(ida_kernwin.action_handler_t):
 
     def update(self, ctx):
         # Enable only in Functions window with selection and hexrays available
-        if hasattr(ctx, "widget_type") and ctx.widget_type == ida_kernwin.BWN_FUNCS:
-            has_selection = hasattr(ctx, "chooser_selection") and ctx.chooser_selection
-            has_hexrays = ida_hexrays.init_hexrays_plugin()
-            return ida_kernwin.AST_ENABLE if has_selection and has_hexrays else ida_kernwin.AST_DISABLE
-        return ida_kernwin.AST_DISABLE
-
-
-class ExportSelectedFunctionsCombinedHandler(ida_kernwin.action_handler_t):
-    def __init__(self):
-        ida_kernwin.action_handler_t.__init__(self)
-
-    def activate(self, ctx):
-        # Get selected functions from Functions window if it's active
-        if hasattr(ctx, "widget_type") and ctx.widget_type == ida_kernwin.BWN_FUNCS:
-            # Get selection from the Functions window
-            selection = ctx.chooser_selection if hasattr(ctx, "chooser_selection") else []
-            if not selection:
-                ida_kernwin.warning("No functions selected")
-                return 1
-
-            # Export selected functions to one combined assembly file
-            export_selected_functions_combined(selection, "asm")
-        else:
-            ida_kernwin.warning("This action is only available in the Functions window")
-        return 1
-
-    def update(self, ctx):
-        # Enable only in Functions window with selection
-        if hasattr(ctx, "widget_type") and ctx.widget_type == ida_kernwin.BWN_FUNCS:
-            return ida_kernwin.AST_ENABLE if hasattr(ctx, "chooser_selection") and ctx.chooser_selection else ida_kernwin.AST_DISABLE
-        return ida_kernwin.AST_DISABLE
-
-
-class ExportSelectedFunctionsCombinedPseudocodeHandler(ida_kernwin.action_handler_t):
-    def __init__(self):
-        ida_kernwin.action_handler_t.__init__(self)
-
-    def activate(self, ctx):
-        # Get selected functions from Functions window if it's active
-        if hasattr(ctx, "widget_type") and ctx.widget_type == ida_kernwin.BWN_FUNCS:
-            # Get selection from the Functions window
-            selection = ctx.chooser_selection if hasattr(ctx, "chooser_selection") else []
-            if not selection:
-                ida_kernwin.warning("No functions selected")
-                return 1
-
-            # Export selected functions to one combined pseudocode file
-            export_selected_functions_combined(selection, "c")
-        else:
-            ida_kernwin.warning("This action is only available in the Functions window")
-        return 1
-
-    def update(self, ctx):
-        # Enable only in Functions window with selection and hexrays available
-        if hasattr(ctx, "widget_type") and ctx.widget_type == ida_kernwin.BWN_FUNCS:
+        if is_functions_window(ctx):
             has_selection = hasattr(ctx, "chooser_selection") and ctx.chooser_selection
             has_hexrays = ida_hexrays.init_hexrays_plugin()
             return ida_kernwin.AST_ENABLE if has_selection and has_hexrays else ida_kernwin.AST_DISABLE
@@ -288,22 +256,15 @@ class AssemportUIHooks(ida_kernwin.UI_Hooks):
                     )
 
         # For Functions window - add selected functions export
-        elif widget_type == ida_kernwin.BWN_FUNCS:
-            if hasattr(ctx, "chooser_selection") and ctx.chooser_selection:
+        elif widget_type == ida_kernwin.BWN_FUNCS or (widget_type == ida_kernwin.BWN_CHOOSER and "Functions" in ida_kernwin.get_widget_title(widget)):
+            if hasattr(ctx, "chooser_selection"):
                 ida_kernwin.attach_action_to_popup(widget, popup_handle, "assemport:export_selected", None)
-                ida_kernwin.attach_action_to_popup(widget, popup_handle, "assemport:export_selected_combined", None)
                 # Add pseudocode export options if hexrays is available
                 if ida_hexrays.init_hexrays_plugin():
                     ida_kernwin.attach_action_to_popup(
                         widget,
                         popup_handle,
                         "assemport:export_selected_pseudocode",
-                        None,
-                    )
-                    ida_kernwin.attach_action_to_popup(
-                        widget,
-                        popup_handle,
-                        "assemport:export_selected_combined_pseudocode",
                         None,
                     )
 
@@ -328,7 +289,7 @@ def check_ref_range(ranges: list, addr: int, cur_range: tuple[int, int], cur_fun
         called_func = ida_funcs.get_func(ref)
         if called_func and called_func.start_ea != cur_func.start_ea:
             if funcs_to_export is not None:
-                funcs_to_export.extend(get_recursive_functions(called_func.start_ea))
+                funcs_to_export.extend(get_recursive_functions(called_func.start_ea, False))
         elif not called_func and (ref < cur_range[0] or ref >= cur_range[1]):
             ranges.append(get_loose_code_block_range(ref))
 
@@ -354,7 +315,6 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
             # Robust lookup: find all hidden ranges overlapping this chunk
             hidden_to_restore = []
             curr_ea = start
-            hidden_funcs = []
             while curr_ea < end:
                 hr = ida_bytes.get_hidden_range(curr_ea)
                 if not hr:
@@ -400,8 +360,8 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
 
     finally:
         for f in hidden_funcs:
-            func.flags |= ida_funcs.FUNC_HIDDEN
-            ida_funcs.update_func(func)
+            f.flags |= ida_funcs.FUNC_HIDDEN
+            ida_funcs.update_func(f)
 
 
 def export_single_function(func):
@@ -554,10 +514,34 @@ def export_single_function_pseudocode(func):
         ida_kernwin.hide_wait_box()
 
 
-def get_recursive_functions(start_ea) -> list:
+# Persistent settings using IDA netnode
+SETTINGS_NODE_NAME = "$ assemport_settings"
+SKIP_NAMED_TAG = "S"
+
+
+def get_skip_named_setting():
+    """Retrieve the 'skip named functions' setting from the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)
+    if node.hashval(SKIP_NAMED_TAG):
+        val = node.hashval(SKIP_NAMED_TAG)
+        return val == b"\x01"
+    return False
+
+
+def set_skip_named_setting(value):
+    """Store the 'skip named functions' setting in the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)
+    node.create(SETTINGS_NODE_NAME)
+    node.hashset(SKIP_NAMED_TAG, b"\x01" if value else b"\x00")
+
+
+def get_recursive_functions(start_ea, initial=True) -> list:
     """Get all functions called by start_ea recursively, excluding library functions"""
     to_export = list()
     stack = [start_ea]
+
+    # Get the current setting from IDB
+    skip_named = get_skip_named_setting()
 
     while stack:
         ea = stack.pop(0)
@@ -573,8 +557,14 @@ def get_recursive_functions(start_ea) -> list:
         if func.flags & ida_funcs.FUNC_LIB:
             continue
 
+        # If setting is enabled, skip any function that doesn't have a default name
+        if skip_named and not initial:
+            initial = False
+            flags = ida_bytes.get_flags(func_ea)
+            if ida_bytes.has_name(flags):
+                continue
+        initial = False
         # Check if it's a thunk with a non-default name (likely an import stub)
-        # Default IDA names typically start with "sub_"
         if func.flags & ida_funcs.FUNC_THUNK:
             flags = ida_bytes.get_flags(func_ea)
             if ida_bytes.has_name(flags):
@@ -733,100 +723,6 @@ def export_selected_functions_pseudocode(selection_indices):
         ida_kernwin.hide_wait_box()
 
 
-def export_selected_functions_combined(selection_indices, file_type):
-    """Export selected functions to one combined file"""
-    if file_type == "asm":
-        ida_kernwin.show_wait_box("Exporting selected functions to combined assembly file...")
-        file_ext = "asm"
-        export_func = export_function_assembly
-    elif file_type == "c":
-        ida_kernwin.show_wait_box("Exporting selected functions to combined pseudocode file...")
-        file_ext = "c"
-        export_func = export_function_pseudocode
-        # Check if hexrays is available
-        if not ida_hexrays.init_hexrays_plugin():
-            ida_kernwin.warning("Hex-Rays decompiler is not available")
-            return
-    else:
-        ida_kernwin.warning("Invalid file type specified")
-        return
-
-    try:
-        # Get Working-Path
-        path = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_CMD))
-        output = os.path.join(path, "Assemport")
-
-        # Create Output-Directory
-        try:
-            os.mkdir(output)
-        except FileExistsError:
-            pass
-        except PermissionError:
-            print(f"[Assemport] Permission denied: Unable to create '{output}'.")
-            return
-        except Exception as e:
-            print(f"[Assemport] An error occurred: {e}")
-            return
-
-        # Create combined filename with timestamp
-        import time
-
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(output, f"combined_functions_{timestamp}.{file_ext}")
-
-        exported_count = 0
-
-        # Get all functions
-        all_functions = list(idautils.Functions())
-
-        with open(filename, "w", encoding="utf-8") as combined_file:
-            # Write header
-            if file_type == "asm":
-                combined_file.write(f"; Combined Assembly Export - {len(selection_indices)} functions\n")
-                combined_file.write(f"; Generated on {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                combined_file.write(";\n\n")
-            else:
-                combined_file.write(f"/* Combined Pseudocode Export - {len(selection_indices)} functions */\n")
-                combined_file.write(f"/* Generated on {time.strftime('%Y-%m-%d %H:%M:%S')} */\n\n")
-
-            for idx in selection_indices:
-                if idx < len(all_functions):
-                    ea = all_functions[idx]
-                    func = ida_funcs.get_func(ea)
-
-                    if func is None:
-                        continue
-
-                    # Get function name
-                    func_name = ida_funcs.get_func_name(ea)
-
-                    # Write separator and function header
-                    if file_type == "asm":
-                        combined_file.write(f"\n; ===============================================\n")
-                        combined_file.write(f"; Function: {func_name}\n")
-                        combined_file.write(f"; Address: 0x{ea:x}\n")
-                        combined_file.write(f"; ===============================================\n\n")
-                    else:
-                        combined_file.write(f"\n/* =============================================== */\n")
-                        combined_file.write(f"/* Function: {func_name} */\n")
-                        combined_file.write(f"/* Address: 0x{ea:x} */\n")
-                        combined_file.write(f"/* =============================================== */\n\n")
-
-                    # Export function content
-                    content = export_func(func, ea)
-                    if content:
-                        combined_file.write(content)
-                        combined_file.write("\n\n")
-                        exported_count += 1
-                        print(f"[Assemport] Added function {func_name} to combined file")
-
-        print(f"[Assemport] Combined export saved to {filename}")
-        ida_kernwin.info(f"Exported {exported_count} functions to combined {file_ext.upper()} file!\nFile: {filename}")
-
-    finally:
-        ida_kernwin.hide_wait_box()
-
-
 def export_function_assembly(func, ea):
     """Helper function to get assembly code for a function"""
     try:
@@ -874,9 +770,23 @@ def export_function_pseudocode(func, ea):
 ui_hooks = None
 
 
+class AssemportSettingsForm(ida_kernwin.Form):
+    def __init__(self, skip_named):
+        form_str = r"""STARTITEM 0
+Assemport Settings
+
+<Skip Named Functions:{rSkipNamedFunctions}>{cGroup}>
+"""
+        controls = {
+            "cGroup": ida_kernwin.Form.ChkGroupControl(["rSkipNamedFunctions"], value=1 if skip_named else 0),
+        }
+        ida_kernwin.Form.__init__(self, form_str, controls)
+
+
 class Assemport(ida_idaapi.plugmod_t):
     def __init__(self):
         global ui_hooks
+        print("[Assemport] Initializing...")
 
         # Register actions
         self.register_actions()
@@ -895,80 +805,66 @@ class Assemport(ida_idaapi.plugmod_t):
     def register_actions(self):
         """Register context menu actions"""
         # Single function export action
+        self.handler_export_single = ExportSingleFunctionHandler()
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_single",
             "Export Function Assembly",
-            ExportSingleFunctionHandler(),
+            self.handler_export_single,
             None,  # No shortcut
             "Export the current function to an assembly file",
         )
         ida_kernwin.register_action(action_desc)
 
         # Single function pseudocode export action
+        self.handler_export_single_pseudocode = ExportSingleFunctionPseudocodeHandler()
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_single_pseudocode",
             "Export Function Pseudocode",
-            ExportSingleFunctionPseudocodeHandler(),
+            self.handler_export_single_pseudocode,
             None,  # No shortcut
             "Export the current function to a pseudocode file",
         )
         ida_kernwin.register_action(action_desc)
 
         # Selected functions export action
+        self.handler_export_selected = ExportSelectedFunctionsHandler()
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_selected",
             "Export Selected Functions Assembly",
-            ExportSelectedFunctionsHandler(),
+            self.handler_export_selected,
             None,  # No shortcut
             "Export selected functions to assembly files",
         )
         ida_kernwin.register_action(action_desc)
 
         # Selected functions pseudocode export action
+        self.handler_export_selected_pseudocode = ExportSelectedFunctionsPseudocodeHandler()
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_selected_pseudocode",
             "Export Selected Functions Pseudocode",
-            ExportSelectedFunctionsPseudocodeHandler(),
+            self.handler_export_selected_pseudocode,
             None,  # No shortcut
             "Export selected functions to pseudocode files",
         )
         ida_kernwin.register_action(action_desc)
 
-        # Selected functions combined assembly export action
-        action_desc = ida_kernwin.action_desc_t(
-            "assemport:export_selected_combined",
-            "Export Selected Functions to Combined Assembly File",
-            ExportSelectedFunctionsCombinedHandler(),
-            None,  # No shortcut
-            "Export selected functions to one combined assembly file",
-        )
-        ida_kernwin.register_action(action_desc)
-
-        # Selected functions combined pseudocode export action
-        action_desc = ida_kernwin.action_desc_t(
-            "assemport:export_selected_combined_pseudocode",
-            "Export Selected Functions to Combined Pseudocode File",
-            ExportSelectedFunctionsCombinedPseudocodeHandler(),
-            None,  # No shortcut
-            "Export selected functions to one combined pseudocode file",
-        )
-        ida_kernwin.register_action(action_desc)
-
         # Recursive function export action
+        self.handler_export_recursive = ExportRecursiveFunctionHandler()
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_recursive",
             "Export Recursive Function Assembly",
-            ExportRecursiveFunctionHandler(),
+            self.handler_export_recursive,
             None,  # No shortcut
             "Export the current function and its sub-calls recursively to assembly files",
         )
         ida_kernwin.register_action(action_desc)
 
         # Recursive function pseudocode export action
+        self.handler_export_recursive_pseudocode = ExportRecursiveFunctionPseudocodeHandler()
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_recursive_pseudocode",
             "Export Recursive Function Pseudocode",
-            ExportRecursiveFunctionPseudocodeHandler(),
+            self.handler_export_recursive_pseudocode,
             None,  # No shortcut
             "Export the current function and its sub-calls recursively to pseudocode files",
         )
@@ -980,8 +876,6 @@ class Assemport(ida_idaapi.plugmod_t):
         ida_kernwin.unregister_action("assemport:export_single_pseudocode")
         ida_kernwin.unregister_action("assemport:export_selected")
         ida_kernwin.unregister_action("assemport:export_selected_pseudocode")
-        ida_kernwin.unregister_action("assemport:export_selected_combined")
-        ida_kernwin.unregister_action("assemport:export_selected_combined_pseudocode")
         ida_kernwin.unregister_action("assemport:export_recursive")
         ida_kernwin.unregister_action("assemport:export_recursive_pseudocode")
 
@@ -993,75 +887,12 @@ class Assemport(ida_idaapi.plugmod_t):
             ui_hooks = None
 
     def run(self, arg):
-        ida_kernwin.show_wait_box("Processing Export")
-
-        # Get Working-Path
-        path = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_CMD))
-        output = os.path.join(path, "Assemport")
-
-        print(f"[Assemport] Path = {path}")
-        print(f"[Assemport] Output = {output}")
-
-        # Create Output-Directory
-        try:
-            os.mkdir(output)
-        except FileExistsError:
-            pass
-        except PermissionError:
-            print(f"[Assemport] Permission denied: Unable to create '{output}'.")
-        except Exception as e:
-            print(f"[Assemport] An error occurred: {e}")
-
-        try:
-            all_eas = list(idautils.Functions())
-            neas = len(all_eas)
-
-            # Iterate each function
-            for i, ea in enumerate(all_eas):
-                if ida_kernwin.user_cancelled():
-                    break
-
-                # Get Func
-                func = ida_funcs.get_func(ea)
-
-                if func is None:
-                    print("[Assemport] Not a Function, Skipping 0x%x" % ea)
-                    continue
-
-                # Get Name
-                func_name = ida_funcs.get_func_name(ea)
-
-                # Get Info
-                ranges = ida_range.rangeset_t()
-                ida_funcs.get_func_ranges(ranges, func)
-
-                # Save Assembly Content
-                file = ida_fpro.qfile_t()
-
-                if file.open(os.path.join(output, "%s.asm" % re.sub(r'[<>:"/\\|?*]', "_", func_name)), "wt"):
-                    try:
-                        unhide_func_and_export_asm(func, file)
-                    finally:
-                        file.close()
-
-                # Save Pseudocode Content (if decompiler is available)
-                if ida_hexrays.init_hexrays_plugin():
-                    try:
-                        cfunc = ida_hexrays.decompile(ea)
-                        if cfunc is not None:
-                            pseudocode = str(cfunc)
-                            filename = os.path.join(output, f"{func_name}.c")
-
-                            with open(filename, "w", encoding="utf-8") as f:
-                                f.write(pseudocode)
-
-                            print(f"[Assemport] Exported pseudocode for {func_name}")
-                    except Exception as e:
-                        print(f"[Assemport] Error decompiling function {func_name}: {e}")
-
-                print(f"[Assemport] Handle function {func_name} on Address 0x{ea:x}")
-                print(func)
-                ida_kernwin.replace_wait_box("Processing Export...\n\n\t%d / %d\t" % (i + 1, neas))
-
-        finally:
-            ida_kernwin.hide_wait_box()
+        current_val = get_skip_named_setting()
+        f = AssemportSettingsForm(current_val)
+        f.Compile()
+        if f.Execute() == 1:
+            new_val = (f.cGroup.value & 1) != 0
+            set_skip_named_setting(new_val)
+            status = "ENABLED" if new_val else "DISABLED"
+            print(f"[Assemport] Skip Named Functions is now {status}")
+        f.Free()
