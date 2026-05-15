@@ -307,10 +307,15 @@ def get_loose_code_block_range(ea):
 def get_loose_data_range(ea):
     end_ea = ea
     while True:
+        if end_ea == idaapi.BADADDR or not ida_bytes.is_mapped(end_ea):
+            break
         name = ida_name.get_name(end_ea)
         if end_ea != ea and name:
             break
-        end_ea = ida_bytes.get_item_end(end_ea)
+        next_ea = ida_bytes.get_item_end(end_ea)
+        if next_ea <= end_ea or next_ea == idaapi.BADADDR:
+            break
+        end_ea = next_ea
     return ida_range.range_t(ea, end_ea)
 
 
@@ -371,6 +376,8 @@ def check_o_ref_range(ranges: list, cur_range: tuple[int, int], cur_func: ida_fu
             continue
         if cur_range[0] <= o_ref < cur_range[1]:
             continue
+        if o_ref == idaapi.BADADDR or not ida_bytes.is_mapped(o_ref):
+            continue
         o_flags = ida_bytes.get_flags(o_ref)
         if ida_bytes.is_code(o_flags):
             check_func_range(ranges, o_ref, cur_func, funcs_to_export, processed_ranges)
@@ -389,18 +396,22 @@ def check_d_ref_range(ranges: list, cur_range: tuple[int, int], cur_func: ida_fu
     ea = cur_range[0]
     ptr_size = ida_ida.inf_get_app_bitness() // 8
     while ea < cur_range[1]:
+        next_ea = ida_bytes.get_item_end(ea)
+        if next_ea <= ea or next_ea == idaapi.BADADDR:
+            break
         if ida_bytes.get_item_size(ea) == ptr_size:
-            ptr = int.from_bytes(ida_bytes.get_bytes(ea, ptr_size), "big" if ida_ida.inf_is_be() else "little")
-            if cur_range[0] <= ptr < cur_range[1]:
-                continue
-            flags = ida_bytes.get_flags(ptr)
-            if ida_bytes.is_code(flags):
-                check_func_range(ranges, ptr, cur_func, funcs_to_export, processed_ranges)
-            else:
-                r = get_loose_data_range(ptr)
-                if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
-                    ranges.append(r)
-        ea = ida_bytes.get_item_end(ea)
+            data = ida_bytes.get_bytes(ea, ptr_size)
+            if data is not None and len(data) == ptr_size:
+                ptr = int.from_bytes(data, "big" if ida_ida.inf_is_be() else "little")
+                if not (cur_range[0] <= ptr < cur_range[1]) and ptr != 0 and ptr != idaapi.BADADDR and ida_bytes.is_mapped(ptr):
+                    flags = ida_bytes.get_flags(ptr)
+                    if ida_bytes.is_code(flags):
+                        check_func_range(ranges, ptr, cur_func, funcs_to_export, processed_ranges)
+                    else:
+                        r = get_loose_data_range(ptr)
+                        if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+                            ranges.append(r)
+        ea = next_ea
 
 
 def check_hidden_range(start: int, end: int, hidden_ranges: list):
