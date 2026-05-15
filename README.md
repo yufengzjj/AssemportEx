@@ -1,39 +1,39 @@
-# AssemportEx (assemport++)
+# AssemportEx
 
 [![IDA Pro](https://img.shields.io/badge/IDA%20Pro-9.0+-blue.svg)](https://hex-rays.com/ida-pro/)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-**AssemportEx** is an enhanced plugin for IDA Pro (>= 9.0) designed for seamless exporting of function assembly and pseudocode. It is optimized for external analysis and AI-assisted reverse engineering workflows.
+IDA Pro (>= 9.0) plugin for exporting function assembly and pseudocode — built for external analysis and AI-assisted reverse engineering.
 
 ## Features
-- **Multi-Format Export**: Save functions as `.asm` (Disassembly) or `.c` (Hex-Rays Pseudocode).
-- **Recursive Extraction**: Automatically identifies and exports the entire call tree (skips library functions and thunks).
-- **Flexible Selection**: Export single functions from disassembly/pseudocode views or multiple selections from the **Functions Window**.
-- **IDA 9.0 Optimized**: Full support for the latest IDA 9.0 UI components and chooser widgets.
-- **Safe extraction**: Handles hidden ranges, unhides chunks temporarily for export, and sanitizes filenames.
+- Export functions as `.asm` or `.c` (Hex-Rays pseudocode).
+- Recursive export of the call tree (skips library functions and thunks).
+- Follows code/data references (branches, `ADR`/`ADRL` operands, data pointers) so each `.asm` is self-contained.
+- Single-function export from disassembly/pseudocode views, multi-selection from the Functions window.
+- Safely handles hidden ranges and sanitizes filenames.
 
 ## Installation
-Place the `AssemportEx` folder into your IDA plugins directory:
-- **Windows**: `%AppData%\Hex-Rays\IDA Pro\plugins\AssemportEx`
-- **Linux/macOS**: `~/.idapro/plugins/AssemportEx`
+Drop the `AssemportEx` folder into your IDA plugins directory:
+- Windows: `%AppData%\Hex-Rays\IDA Pro\plugins\AssemportEx`
+- Linux/macOS: `~/.idapro/plugins/AssemportEx`
 
-Restart IDA Pro or use `Ctrl+Shift+P` to refresh plugins.
+Restart IDA.
 
-## Usage & Configuration
+## Usage
+Right-click in **Disassembly**, **Pseudocode**, or the **Functions** window to export the current/selected function, or its full recursive call tree.
 
-### Exporting Code
-Right-click on a function or selection in the **Disassembly**, **Pseudocode**, or **Functions Window** to access:
-- **Export Function Assembly/Pseudocode**: Save the current or selected functions.
-- **Export Recursive**: Export the function and all sub-calls in the tree.
+Output is written to an `Assemport/` folder next to your IDB.
 
-### Settings
-Navigate to `Edit -> Plugins -> AssemportEx` to configure:
-- **Skip Named Functions**: Recursive exports skip functions with custom names, focusing on auto-named `sub_XXXX` functions.
-- **Global ASM Fragment Deduplication**: Prevents redundant export of shared code blocks across different functions during recursive ASM export.
+## Settings
+`Edit → Plugins → AssemportEx`:
 
-## Output
-All files are saved in an `Assemport` subdirectory relative to your database file.
+| Setting | Effect |
+|---|---|
+| Skip Named Func | Recursive export skips functions with custom names (keeps `sub_XXXX`). |
+| Skip Named Data | When following refs, skip data with custom names (assumed exported elsewhere). |
+| Global ASM/DATA Fragment Deduplication | Deduplicates shared code/data fragments across recursive exports. |
+| Skip Refs From Code | Don't follow operand refs (`ADR`/`ADRL`). Call/branch refs are still followed. |
+| Skip Refs From Data | Don't follow pointer refs inside data (vtables, jump tables, etc.). |
 
 ## Credits
-- Based on the original [Assemport](https://github.com/Bizarrus/Assemport) by [Bizarrus](https://github.com/Bizarrus/Assemport).
-- Enhanced and updated for IDA 9.0+.
+Based on [Assemport](https://github.com/Bizarrus/Assemport) by [Bizarrus](https://github.com/Bizarrus). Enhanced for IDA 9.0+.
