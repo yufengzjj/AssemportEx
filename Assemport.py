@@ -1,16 +1,19 @@
 import os
 import re
+import traceback
 
 import ida_bytes
 import ida_fpro
 import ida_funcs
 import ida_hexrays
+import ida_ida
 import ida_idaapi
 import ida_kernwin
 import ida_lines
 import ida_loader
 import ida_name
 import ida_range
+import ida_ua
 import idaapi
 import idautils
 
@@ -301,30 +304,125 @@ def get_loose_code_block_range(ea):
     return ida_range.range_t(ea, end_ea)
 
 
+def get_loose_data_range(ea):
+    end_ea = ea
+    while True:
+        name = ida_name.get_name(end_ea)
+        if end_ea != ea and name:
+            break
+        end_ea = ida_bytes.get_item_end(end_ea)
+    return ida_range.range_t(ea, end_ea)
+
+
+def check_func_range(ranges: list, ref: int, cur_func: ida_funcs.func_t, funcs_to_export: list | None, processed_ranges: set):
+    """check the possible func range(or just a commom code chunk)"""
+    func = ida_funcs.get_func(ref)
+    if func and func.start_ea != cur_func.start_ea:
+        if ref == func.start_ea:
+            if funcs_to_export is not None:
+                funcs_to_export.extend(get_recursive_functions(func.start_ea, False))
+        else:
+            if func.start_ea <= ref < func.end_ea:
+                r = ida_range.range_t(ref, func.end_ea)
+                if (ref, func.end_ea) not in processed_ranges and r not in ranges:
+                    ranges.append(r)
+            else:
+                r = get_loose_code_block_range(ref)
+                if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+                    ranges.append(r)
+    elif not func:
+        r = get_loose_code_block_range(ref)
+        if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+            ranges.append(r)
+
+
 def check_ref_range(
     ranges: list, addr: int, cur_range: tuple[int, int], cur_func: ida_funcs.func_t, funcs_to_export: list | None, processed_ranges: set
 ):
+    """check code ref at addr"""
     for ref in idautils.CodeRefsFrom(addr, False):
         if cur_range[0] <= ref < cur_range[1]:
             continue
-        called_func = ida_funcs.get_func(ref)
-        if called_func and called_func.start_ea != cur_func.start_ea:
-            if ref == called_func.start_ea:
-                if funcs_to_export is not None:
-                    funcs_to_export.extend(get_recursive_functions(called_func.start_ea, False))
-            else:
-                if called_func.start_ea <= ref < called_func.end_ea:
-                    r = ida_range.range_t(ref, called_func.end_ea)
-                    if (ref, called_func.end_ea) not in processed_ranges and r not in ranges:
-                        ranges.append(r)
-                else:
-                    r = get_loose_code_block_range(ref)
-                    if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
-                        ranges.append(r)
-        elif not called_func:
-            r = get_loose_code_block_range(ref)
+        check_func_range(ranges, ref, cur_func, funcs_to_export, processed_ranges)
+
+
+def get_ref_from_insn(ea):
+    insn = ida_ua.insn_t()  # ty:ignore[missing-argument]
+    if ida_ua.decode_insn(insn, ea) == 0:
+        return None
+
+    mn = insn.get_canon_mnem()
+    if mn not in ("ADR", "ADRL"):
+        return None
+    for op in insn.ops:
+        if op.type in (idaapi.o_mem, idaapi.o_imm, idaapi.o_far, idaapi.o_near):
+            if op.addr != 0 and op.addr != idaapi.BADADDR:
+                return op.addr
+            if op.value != 0 and op.value != idaapi.BADADDR:
+                return op.value
+    return None
+
+
+def check_o_ref_range(ranges: list, cur_range: tuple[int, int], cur_func: ida_funcs.func_t, funcs_to_export: list | None, processed_ranges: set):
+    """check code opraand ref in cur_range"""
+    for head in idautils.Heads(*cur_range):
+        o_ref = get_ref_from_insn(head)
+        if o_ref is None:
+            continue
+        if cur_range[0] <= o_ref < cur_range[1]:
+            continue
+        o_flags = ida_bytes.get_flags(o_ref)
+        if ida_bytes.is_code(o_flags):
+            check_func_range(ranges, o_ref, cur_func, funcs_to_export, processed_ranges)
+        elif ida_bytes.is_data(o_flags):
+            r = ida_range.range_t(o_ref, o_ref + ida_bytes.get_item_size(o_ref))
             if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
                 ranges.append(r)
+        else:
+            r = get_loose_data_range(o_ref)
+            if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+                ranges.append(r)
+
+
+def check_d_ref_range(ranges: list, cur_range: tuple[int, int], cur_func: ida_funcs.func_t, funcs_to_export: list | None, processed_ranges: set):
+    """check data ref"""
+    ea = cur_range[0]
+    ptr_size = ida_ida.inf_get_app_bitness() // 8
+    while ea < cur_range[1]:
+        if ida_bytes.get_item_size(ea) == ptr_size:
+            ptr = int.from_bytes(ida_bytes.get_bytes(ea, ptr_size), "big" if ida_ida.inf_is_be() else "little")
+            if cur_range[0] <= ptr < cur_range[1]:
+                continue
+            flags = ida_bytes.get_flags(ptr)
+            if ida_bytes.is_code(flags):
+                check_func_range(ranges, ptr, cur_func, funcs_to_export, processed_ranges)
+            else:
+                r = get_loose_data_range(ptr)
+                if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+                    ranges.append(r)
+        ea = ida_bytes.get_item_end(ea)
+
+
+def check_hidden_range(start: int, end: int, hidden_ranges: list):
+    curr_ea = start
+    while curr_ea < end:
+        hr = ida_bytes.get_hidden_range(curr_ea)
+        if not hr:
+            hr = ida_bytes.get_next_hidden_range(curr_ea)
+            if not hr or hr.start_ea >= end:
+                break
+        hidden_ranges.append(
+            (
+                hr.start_ea,
+                hr.end_ea,
+                hr.description,
+                hr.header,
+                hr.footer,
+                hr.color,
+            )
+        )
+        ida_bytes.del_hidden_range(hr.start_ea)
+        curr_ea = hr.end_ea  # Move to end of deleted range
 
 
 def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: list | None = None, processed_ranges: set | None = None):
@@ -335,46 +433,26 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
         func.flags &= ~ida_funcs.FUNC_HIDDEN
         ida_funcs.update_func(func)
     try:
-        ranges = ida_range.rangeset_t()
+        ranges = ida_range.rangeset_t()  # ty:ignore[missing-argument]
         ida_funcs.get_func_ranges(ranges, func)
-
-        # Sort ranges: body (starting at func.start_ea) first, then others by address
         all_ranges = [ranges.getrange(i) for i in range(ranges.nranges())]
         all_ranges.sort(key=lambda r: (0 if r.start_ea == func.start_ea else 1, r.start_ea))
         processed_ranges = set() if processed_ranges is None else processed_ranges
+        data_ranges = []
+        hidden_ranges = []
         while len(all_ranges) > 0:
             r = all_ranges.pop(0)
             start, end = r.start_ea, r.end_ea
-            # Robust lookup: find all hidden ranges overlapping this chunk
-            hidden_to_restore = []
-            curr_ea = start
-            while curr_ea < end:
-                hr = ida_bytes.get_hidden_range(curr_ea)
-                if not hr:
-                    hr = ida_bytes.get_next_hidden_range(curr_ea)
-                    if not hr or hr.start_ea >= end:
-                        break
-
-                # We found a hidden range overlapping [curr_ea, end)
-                # Store it and delete it
-                hidden_to_restore.append(
-                    (
-                        hr.start_ea,
-                        hr.end_ea,
-                        hr.description,
-                        hr.header,
-                        hr.footer,
-                        hr.color,
-                    )
-                )
-                ida_bytes.del_hidden_range(hr.start_ea)
-                curr_ea = hr.end_ea  # Move to end of deleted range
+            if start >= end:
+                continue
+            check_hidden_range(start, end, hidden_ranges)
             f = ida_funcs.get_func(start)
             if f and f.start_ea != func.start_ea and f.flags & ida_funcs.FUNC_HIDDEN:
                 hidden_funcs.append(f)
                 f.flags &= ~ida_funcs.FUNC_HIDDEN
                 ida_funcs.update_func(f)
-            try:
+            flags = ida_bytes.get_flags(start)
+            if ida_bytes.is_code(flags):
                 if start >= func.start_ea and end <= func.end_ea:
                     ida_loader.gen_file(ida_loader.OFILE_ASM, file.get_fp(), start, end, 0)
                     check_ref_range(all_ranges, ida_bytes.prev_head(end, start), (start, end), func, funcs_to_export, processed_ranges)
@@ -386,15 +464,33 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
                         ida_fpro._ida_fpro.qfile_t_write(file, f"{ida_lines.tag_remove(disasm)}\n")  # ty:ignore[unresolved-attribute]
                         check_ref_range(all_ranges, head, (start, end), func, funcs_to_export, processed_ranges)
                     ida_fpro._ida_fpro.qfile_t_write(file, "\n")  # ty:ignore[unresolved-attribute]
-                processed_ranges.add((start, end))
-            finally:
-                for hr_data in hidden_to_restore:
-                    ida_bytes.add_hidden_range(*hr_data)
+                check_o_ref_range(all_ranges, (start, end), func, funcs_to_export, processed_ranges)
+            else:
+                data_ranges.append(r)
+                check_d_ref_range(all_ranges, (start, end), func, funcs_to_export, processed_ranges)
+            processed_ranges.add((start, end))
+        while len(data_ranges) > 0:
+            r = data_ranges.pop(0)
+            start, end = r.start_ea, r.end_ea
+            flags = ida_bytes.get_flags(start)
+            r_name = ida_name.get_name(start)
+            if ida_bytes.is_data(flags):
+                disasm = ida_lines.generate_disasm_line(start, 0)
+                ida_fpro._ida_fpro.qfile_t_write(file, f"{r_name} {ida_lines.tag_remove(disasm)}\n")  # ty:ignore[unresolved-attribute]
+            else:
+                ida_fpro._ida_fpro.qfile_t_write(file, f"{r_name}\n")  # ty:ignore[unresolved-attribute]
+                ea = start
+                while ea < end:
+                    disasm = ida_lines.generate_disasm_line(ea, 0)
+                    ida_fpro._ida_fpro.qfile_t_write(file, f"{ida_lines.tag_remove(disasm)}\n")  # ty:ignore[unresolved-attribute]
+                    ea = ida_bytes.get_item_end(ea)
 
     finally:
         for f in hidden_funcs:
             f.flags |= ida_funcs.FUNC_HIDDEN
             ida_funcs.update_func(f)
+        for hr in hidden_ranges:
+            ida_bytes.add_hidden_range(*hr)
 
 
 def export_single_function(func):
@@ -555,7 +651,7 @@ DEDUPE_ASM_TAG = "D"
 
 def get_skip_named_setting():
     """Retrieve the 'skip named functions' setting from the IDB netnode"""
-    node = idaapi.netnode(SETTINGS_NODE_NAME)
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
     if node.hashval(SKIP_NAMED_TAG):
         val = node.hashval(SKIP_NAMED_TAG)
         return val == b"\x01"
@@ -564,14 +660,14 @@ def get_skip_named_setting():
 
 def set_skip_named_setting(value):
     """Store the 'skip named functions' setting in the IDB netnode"""
-    node = idaapi.netnode(SETTINGS_NODE_NAME)
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
     node.create(SETTINGS_NODE_NAME)
     node.hashset(SKIP_NAMED_TAG, b"\x01" if value else b"\x00")
 
 
 def get_dedupe_asm_setting():
     """Retrieve the 'dedupe ASM fragments' setting from the IDB netnode"""
-    node = idaapi.netnode(SETTINGS_NODE_NAME)
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
     if node.hashval(DEDUPE_ASM_TAG):
         val = node.hashval(DEDUPE_ASM_TAG)
         return val == b"\x01"
@@ -580,7 +676,7 @@ def get_dedupe_asm_setting():
 
 def set_dedupe_asm_setting(value):
     """Store the 'dedupe ASM fragments' setting in the IDB netnode"""
-    node = idaapi.netnode(SETTINGS_NODE_NAME)
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
     node.create(SETTINGS_NODE_NAME)
     node.hashset(DEDUPE_ASM_TAG, b"\x01" if value else b"\x00")
 
@@ -636,59 +732,51 @@ def export_recursive_functions(start_ea, mode="asm"):
     ida_kernwin.show_wait_box("analyzing recursive calls...")
 
     try:
-        functions_to_export = get_recursive_functions(start_ea)
-        total = len(functions_to_export)
-
-        if total == 0:
+        funcs_to_export = get_recursive_functions(start_ea)
+        if len(funcs_to_export) == 0:
             ida_kernwin.warning(f"no functions found at:{start_ea:#x} to export")
             return
-
-        ida_kernwin.replace_wait_box(f"exporting {total} functions...")
-
-        # Get Working-Path
+        ida_kernwin.replace_wait_box(f"exporting {len(funcs_to_export)} functions...")
         path = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_CMD))
         output = os.path.join(path, "Assemport")
-
-        # Create Output-Directory
         try:
             os.mkdir(output)
         except FileExistsError:
             pass
-
         exported_count = 0
-        i = 0
         processed = set()
         global_processed_ranges = set() if get_dedupe_asm_setting() else None
 
-        while len(functions_to_export) > 0:
-            i += 1
-            ea = functions_to_export.pop(0)
+        while len(funcs_to_export) > 0:
+            ea = funcs_to_export.pop(0)
             if ea in processed:
                 continue
             if ida_kernwin.user_cancelled():
                 break
             func = ida_funcs.get_func(ea)
+            if func is None or func.start_ea != ea:
+                continue
             func_name = ida_funcs.get_func_name(ea)
 
-            ida_kernwin.replace_wait_box(f"exporting {i + 1}/{total}: {func_name}")
+            ida_kernwin.replace_wait_box(f"exporting {exported_count + 1}/{len(funcs_to_export)}: {func_name}")
 
             if mode == "asm":
                 # Save Content
-                file = ida_fpro.qfile_t()
+                file = ida_fpro.qfile_t()  # ty:ignore[missing-argument]
                 filename = os.path.join(output, f"{re.sub(r'[<>:"/\\|?*]', '_', func_name)}.asm")
 
                 if file.open(filename, "wt"):
                     try:
-                        assert isinstance(func, ida_funcs.func_t)
-                        unhide_func_and_export_asm(func, file, functions_to_export, global_processed_ranges)
+                        unhide_func_and_export_asm(func, file, funcs_to_export, global_processed_ranges)
                         processed.add(func.start_ea)
                         exported_count += 1
+                    except Exception as e:
+                        print(f"export func:{ea:#x} error:{traceback.format_exception(e)}")
                     finally:
                         file.close()
             elif mode == "c":
                 if not ida_hexrays.init_hexrays_plugin():
                     continue
-
                 try:
                     cfunc = ida_hexrays.decompile(ea)
                     if cfunc:
@@ -699,9 +787,9 @@ def export_recursive_functions(start_ea, mode="asm"):
                         exported_count += 1
                 except:
                     pass
-
-        ida_kernwin.info(f"recursively exported {exported_count} functions successfully!")
-
+        ida_kernwin.info(f"recursively exported {exported_count}/{exported_count + len(funcs_to_export)} functions successfully!")
+    except Exception as e:
+        ida_kernwin.error(f"export func error:{traceback.format_exception(e)}")
     finally:
         ida_kernwin.hide_wait_box()
 
