@@ -953,7 +953,7 @@ class AssemportSettingsForm(ida_kernwin.Form):
         form_str = r"""STARTITEM 0
 Assemport Settings
 
-<Skip Named Functions:{rSkipNamedFunctions}>
+<Skip Named Func/Data:{rSkipNamedFunctions}>
 <Global ASM/DATA Fragment Deduplication:{rDedupeAsm}>
 <Skip Refs From Code:{rSkipCodeRefs}>
 <Skip Refs From Data:{rSkipDataRefs}>{cGroup}>
