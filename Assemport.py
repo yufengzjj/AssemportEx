@@ -317,6 +317,7 @@ def get_loose_data_range(ea):
         if next_ea <= end_ea or next_ea == idaapi.BADADDR:
             break
         end_ea = next_ea
+        break
     return ida_range.range_t(ea, end_ea)
 
 
@@ -499,7 +500,7 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
                     r_name = ida_name.get_name(start)
                     ida_fpro._ida_fpro.qfile_t_write(file, f"{r_name}\n")  # ty:ignore[unresolved-attribute]
                     for head in idautils.Heads(start, end):
-                        disasm = ida_lines.generate_disasm_line(head, 0)
+                        disasm = ida_lines.generate_disasm_line(head, ida_lines.GENDSM_REMOVE_TAGS | ida_lines.GENDSM_MULTI_LINE)
                         ida_fpro._ida_fpro.qfile_t_write(file, f"{ida_lines.tag_remove(disasm)}\n")  # ty:ignore[unresolved-attribute]
                         check_c_ref_range(all_ranges, head, (start, end), func, funcs_to_export, processed_ranges)
                     ida_fpro._ida_fpro.qfile_t_write(file, "\n")  # ty:ignore[unresolved-attribute]
@@ -515,16 +516,15 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
             start, end = r.start_ea, r.end_ea
             flags = ida_bytes.get_flags(start)
             r_name = ida_name.get_name(start)
-            if ida_bytes.is_data(flags):
-                disasm = ida_lines.generate_disasm_line(start, 0)
+            if ida_bytes.is_data(flags) or ida_segment.segtype(start) == ida_segment.SEG_BSS:
+                disasm = ida_lines.generate_disasm_line(start, ida_lines.GENDSM_REMOVE_TAGS | ida_lines.GENDSM_MULTI_LINE)
                 ida_fpro._ida_fpro.qfile_t_write(file, f"{r_name} {ida_lines.tag_remove(disasm)}\n")  # ty:ignore[unresolved-attribute]
             else:
                 ida_fpro._ida_fpro.qfile_t_write(file, f"{r_name}\n")  # ty:ignore[unresolved-attribute]
                 ea = start
                 while ea < end:
-                    disasm = ida_lines.generate_disasm_line(ea, 0)
-                    if disasm:
-                        ida_fpro._ida_fpro.qfile_t_write(file, f"{ida_lines.tag_remove(disasm)}\n")  # ty:ignore[unresolved-attribute]
+                    disasm = ida_lines.generate_disasm_line(ea, ida_lines.GENDSM_REMOVE_TAGS | ida_lines.GENDSM_MULTI_LINE)
+                    ida_fpro._ida_fpro.qfile_t_write(file, f"{ida_lines.tag_remove(disasm)}\n")  # ty:ignore[unresolved-attribute]
                     ea = ida_bytes.get_item_end(ea)
 
     finally:
