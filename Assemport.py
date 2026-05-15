@@ -336,7 +336,7 @@ def check_func_range(ranges: list, ref: int, cur_func: ida_funcs.func_t, funcs_t
             ranges.append(r)
 
 
-def check_ref_range(
+def check_c_ref_range(
     ranges: list, addr: int, cur_range: tuple[int, int], cur_func: ida_funcs.func_t, funcs_to_export: list | None, processed_ranges: set
 ):
     """check code ref at addr"""
@@ -432,6 +432,8 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
         hidden_funcs.append(func)
         func.flags &= ~ida_funcs.FUNC_HIDDEN
         ida_funcs.update_func(func)
+    skip_code_refs = get_skip_code_refs_setting()
+    skip_data_refs = get_skip_data_refs_setting()
     try:
         ranges = ida_range.rangeset_t()  # ty:ignore[missing-argument]
         ida_funcs.get_func_ranges(ranges, func)
@@ -455,19 +457,21 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
             if ida_bytes.is_code(flags):
                 if start >= func.start_ea and end <= func.end_ea:
                     ida_loader.gen_file(ida_loader.OFILE_ASM, file.get_fp(), start, end, 0)
-                    check_ref_range(all_ranges, ida_bytes.prev_head(end, start), (start, end), func, funcs_to_export, processed_ranges)
+                    check_c_ref_range(all_ranges, ida_bytes.prev_head(end, start), (start, end), func, funcs_to_export, processed_ranges)
                 else:
                     r_name = ida_name.get_name(start)
                     ida_fpro._ida_fpro.qfile_t_write(file, f"{r_name}\n")  # ty:ignore[unresolved-attribute]
                     for head in idautils.Heads(start, end):
                         disasm = ida_lines.generate_disasm_line(head, 0)
                         ida_fpro._ida_fpro.qfile_t_write(file, f"{ida_lines.tag_remove(disasm)}\n")  # ty:ignore[unresolved-attribute]
-                        check_ref_range(all_ranges, head, (start, end), func, funcs_to_export, processed_ranges)
+                        check_c_ref_range(all_ranges, head, (start, end), func, funcs_to_export, processed_ranges)
                     ida_fpro._ida_fpro.qfile_t_write(file, "\n")  # ty:ignore[unresolved-attribute]
-                check_o_ref_range(all_ranges, (start, end), func, funcs_to_export, processed_ranges)
+                if not skip_code_refs:
+                    check_o_ref_range(all_ranges, (start, end), func, funcs_to_export, processed_ranges)
             else:
                 data_ranges.append(r)
-                check_d_ref_range(all_ranges, (start, end), func, funcs_to_export, processed_ranges)
+                if not skip_data_refs:
+                    check_d_ref_range(all_ranges, (start, end), func, funcs_to_export, processed_ranges)
             processed_ranges.add((start, end))
         while len(data_ranges) > 0:
             r = data_ranges.pop(0)
@@ -647,6 +651,8 @@ def export_single_function_pseudocode(func):
 SETTINGS_NODE_NAME = "$ assemport_settings"
 SKIP_NAMED_TAG = "S"
 DEDUPE_ASM_TAG = "D"
+SKIP_CODE_REFS_TAG = "C"
+SKIP_DATA_REFS_TAG = "R"
 
 
 def get_skip_named_setting():
@@ -679,6 +685,38 @@ def set_dedupe_asm_setting(value):
     node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
     node.create(SETTINGS_NODE_NAME)
     node.hashset(DEDUPE_ASM_TAG, b"\x01" if value else b"\x00")
+
+
+def get_skip_code_refs_setting():
+    """Retrieve the 'skip refs from code' setting from the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    if node.hashval(SKIP_CODE_REFS_TAG):
+        val = node.hashval(SKIP_CODE_REFS_TAG)
+        return val == b"\x01"
+    return False
+
+
+def set_skip_code_refs_setting(value):
+    """Store the 'skip refs from code' setting in the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    node.create(SETTINGS_NODE_NAME)
+    node.hashset(SKIP_CODE_REFS_TAG, b"\x01" if value else b"\x00")
+
+
+def get_skip_data_refs_setting():
+    """Retrieve the 'skip refs from data' setting from the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    if node.hashval(SKIP_DATA_REFS_TAG):
+        val = node.hashval(SKIP_DATA_REFS_TAG)
+        return val == b"\x01"
+    return False
+
+
+def set_skip_data_refs_setting(value):
+    """Store the 'skip refs from data' setting in the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    node.create(SETTINGS_NODE_NAME)
+    node.hashset(SKIP_DATA_REFS_TAG, b"\x01" if value else b"\x00")
 
 
 def get_recursive_functions(start_ea, initial=True) -> list:
@@ -911,18 +949,20 @@ ui_hooks = None
 
 
 class AssemportSettingsForm(ida_kernwin.Form):
-    def __init__(self, skip_named, dedupe_asm):
+    def __init__(self, skip_named, dedupe_asm, skip_code_refs, skip_data_refs):
         form_str = r"""STARTITEM 0
 Assemport Settings
 
 <Skip Named Functions:{rSkipNamedFunctions}>
-<Global ASM Fragment Deduplication:{rDedupeAsm}>{cGroup}>
+<Global ASM/DATA Fragment Deduplication:{rDedupeAsm}>
+<Skip Refs From Code:{rSkipCodeRefs}>
+<Skip Refs From Data:{rSkipDataRefs}>{cGroup}>
 """
         controls = {
             "cGroup": ida_kernwin.Form.ChkGroupControl(
-                ["rSkipNamedFunctions", "rDedupeAsm"],
-                value=(1 if skip_named else 0) | (2 if dedupe_asm else 0),
-            ),
+                ["rSkipNamedFunctions", "rDedupeAsm", "rSkipCodeRefs", "rSkipDataRefs"],  # ty:ignore[invalid-argument-type]
+                value=(1 if skip_named else 0) | (2 if dedupe_asm else 0) | (4 if skip_code_refs else 0) | (8 if skip_data_refs else 0),
+            ),  # ty:ignore[missing-argument]
         }
         ida_kernwin.Form.__init__(self, form_str, controls)
 
@@ -1033,12 +1073,21 @@ class Assemport(ida_idaapi.plugmod_t):
     def run(self, arg):
         skip_named = get_skip_named_setting()
         dedupe_asm = get_dedupe_asm_setting()
-        f = AssemportSettingsForm(skip_named, dedupe_asm)
+        skip_code_refs = get_skip_code_refs_setting()
+        skip_data_refs = get_skip_data_refs_setting()
+        f = AssemportSettingsForm(skip_named, dedupe_asm, skip_code_refs, skip_data_refs)
         f.Compile()
         if f.Execute() == 1:
             new_skip_named = (f.cGroup.value & 1) != 0
             new_dedupe_asm = (f.cGroup.value & 2) != 0
+            new_skip_code_refs = (f.cGroup.value & 4) != 0
+            new_skip_data_refs = (f.cGroup.value & 8) != 0
             set_skip_named_setting(new_skip_named)
             set_dedupe_asm_setting(new_dedupe_asm)
-            print(f"[Assemport] Settings updated: Skip Named={new_skip_named}, Dedupe ASM={new_dedupe_asm}")
+            set_skip_code_refs_setting(new_skip_code_refs)
+            set_skip_data_refs_setting(new_skip_data_refs)
+            print(
+                f"[Assemport] Settings updated: Skip Named={new_skip_named}, Dedupe ASM/DATA={new_dedupe_asm}, "
+                f"Skip Code Refs={new_skip_code_refs}, Skip Data Refs={new_skip_data_refs}"
+            )
         f.Free()
