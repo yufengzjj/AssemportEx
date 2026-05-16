@@ -305,7 +305,7 @@ def get_loose_code_block_range(ea):
     return ida_range.range_t(ea, end_ea)
 
 
-def get_loose_data_range(ea):
+def get_loose_data_range(ea, max_explore_len=0):
     end_ea = ea
     while True:
         if end_ea == idaapi.BADADDR or not ida_bytes.is_mapped(end_ea):
@@ -317,7 +317,8 @@ def get_loose_data_range(ea):
         if next_ea <= end_ea or next_ea == idaapi.BADADDR:
             break
         end_ea = next_ea
-        break
+        if max_explore_len <= 0 or end_ea - ea >= max_explore_len:
+            break
     return ida_range.range_t(ea, end_ea)
 
 
@@ -380,6 +381,7 @@ def check_o_ref_range(
     funcs_to_export: list | None,
     processed_ranges: set,
     skip_named_data: bool = False,
+    max_explore_len: int = 0,
 ):
     """check code opraand ref in cur_range"""
     for head in idautils.Heads(*cur_range):
@@ -402,7 +404,7 @@ def check_o_ref_range(
         else:
             if skip_named_data and ida_bytes.has_name(o_flags):
                 continue
-            r = get_loose_data_range(o_ref)
+            r = get_loose_data_range(o_ref, max_explore_len)
             if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
                 ranges.append(r)
 
@@ -414,6 +416,7 @@ def check_d_ref_range(
     funcs_to_export: list | None,
     processed_ranges: set,
     skip_named_data: bool = False,
+    max_explore_len: int = 0,
 ):
     """check data ref"""
     ea = cur_range[0]
@@ -437,7 +440,7 @@ def check_d_ref_range(
                     if ida_bytes.is_code(flags):
                         check_func_range(ranges, ptr, cur_func, funcs_to_export, processed_ranges)
                     elif not (skip_named_data and ida_bytes.has_name(flags)):
-                        r = get_loose_data_range(ptr)
+                        r = get_loose_data_range(ptr, max_explore_len)
                         if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
                             ranges.append(r)
         ea = next_ea
@@ -475,6 +478,7 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
     skip_code_refs = get_skip_code_refs_setting()
     skip_data_refs = get_skip_data_refs_setting()
     skip_named_data = get_skip_named_data_setting()
+    max_explore_len = get_loose_data_len_setting()
     try:
         ranges = ida_range.rangeset_t()  # ty:ignore[missing-argument]
         ida_funcs.get_func_ranges(ranges, func)
@@ -508,11 +512,11 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
                         check_c_ref_range(all_ranges, head, (start, end), func, funcs_to_export, processed_ranges)
                     ida_fpro._ida_fpro.qfile_t_write(file, "\n")  # ty:ignore[unresolved-attribute]
                 if not skip_code_refs:
-                    check_o_ref_range(all_ranges, (start, end), func, funcs_to_export, processed_ranges, skip_named_data)
+                    check_o_ref_range(all_ranges, (start, end), func, funcs_to_export, processed_ranges, skip_named_data, max_explore_len)
             else:
                 data_ranges.append(r)
                 if not skip_data_refs:
-                    check_d_ref_range(all_ranges, (start, end), func, funcs_to_export, processed_ranges, skip_named_data)
+                    check_d_ref_range(all_ranges, (start, end), func, funcs_to_export, processed_ranges, skip_named_data, max_explore_len)
             processed_ranges.add((start, end))
         while len(data_ranges) > 0:
             r = data_ranges.pop(0)
@@ -696,6 +700,7 @@ SKIP_CODE_REFS_TAG = "C"
 SKIP_DATA_REFS_TAG = "R"
 SKIP_NAMED_DATA_TAG = "N"
 MERGE_OUTPUT_TAG = "M"
+LOOSE_DATA_LEN_TAG = "L"
 
 
 def get_skip_named_func_setting():
@@ -792,6 +797,25 @@ def set_merge_output_setting(value):
     node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
     node.create(SETTINGS_NODE_NAME)
     node.hashset(MERGE_OUTPUT_TAG, b"\x01" if value else b"\x00")
+
+
+def get_loose_data_len_setting():
+    """Retrieve the 'max unknown data explore length' setting from the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    val = node.hashval(LOOSE_DATA_LEN_TAG)
+    if val:
+        try:
+            return max(0, int(val.decode()))
+        except (ValueError, UnicodeDecodeError):
+            return 0
+    return 0
+
+
+def set_loose_data_len_setting(value):
+    """Store the 'max unknown data explore length' setting in the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    node.create(SETTINGS_NODE_NAME)
+    node.hashset(LOOSE_DATA_LEN_TAG, str(max(0, int(value))).encode())
 
 
 def get_recursive_functions(start_ea, initial=True) -> list:
@@ -1033,7 +1057,7 @@ ui_hooks = None
 
 
 class AssemportSettingsForm(ida_kernwin.Form):
-    def __init__(self, skip_named_func, dedupe, skip_code_refs, skip_data_refs, skip_named_data, merge_output):
+    def __init__(self, skip_named_func, dedupe, skip_code_refs, skip_data_refs, skip_named_data, merge_output, loose_data_len):
         form_str = r"""STARTITEM 0
 Assemport Settings
 
@@ -1043,6 +1067,8 @@ Assemport Settings
 <Skip Refs From Code:{rSkipCodeRefs}>
 <Skip Refs From Data:{rSkipDataRefs}>
 <Merge Exported Functions Into One File:{rMergeOutput}>{cGroup}>
+
+<Max Unknown Data Explore Length (0 = off):{iLooseDataLen}>
 """
         controls = {
             "cGroup": ida_kernwin.Form.ChkGroupControl(
@@ -1054,6 +1080,7 @@ Assemport Settings
                 | (16 if skip_data_refs else 0)
                 | (32 if merge_output else 0),
             ),  # ty:ignore[missing-argument]
+            "iLooseDataLen": ida_kernwin.Form.NumericInput(tp=ida_kernwin.Form.FT_DEC, value=loose_data_len),  # ty:ignore[missing-argument]
         }
         ida_kernwin.Form.__init__(self, form_str, controls)
 
@@ -1068,7 +1095,7 @@ class Assemport(ida_idaapi.plugmod_t):
 
         # Install UI hooks
         if ui_hooks is None:
-            ui_hooks = AssemportUIHooks()
+            ui_hooks = AssemportUIHooks()  # ty:ignore[missing-argument]
             ui_hooks.hook()
 
     def __del__(self):
@@ -1080,66 +1107,66 @@ class Assemport(ida_idaapi.plugmod_t):
     def register_actions(self):
         """Register context menu actions"""
         # Single function export action
-        self.handler_export_single = ExportSingleFunctionHandler()
+        self.handler_export_single = ExportSingleFunctionHandler()  # ty:ignore[missing-argument]
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_single",
             "Export Function Assembly",
-            self.handler_export_single,
+            self.handler_export_single,  # ty:ignore[too-many-positional-arguments]
             None,  # No shortcut
             "Export the current function to an assembly file",
         )
         ida_kernwin.register_action(action_desc)
 
         # Single function pseudocode export action
-        self.handler_export_single_pseudocode = ExportSingleFunctionPseudocodeHandler()
+        self.handler_export_single_pseudocode = ExportSingleFunctionPseudocodeHandler()  # ty:ignore[missing-argument]
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_single_pseudocode",
             "Export Function Pseudocode",
-            self.handler_export_single_pseudocode,
+            self.handler_export_single_pseudocode,  # ty:ignore[too-many-positional-arguments]
             None,  # No shortcut
             "Export the current function to a pseudocode file",
         )
         ida_kernwin.register_action(action_desc)
 
         # Selected functions export action
-        self.handler_export_selected = ExportSelectedFunctionsHandler()
+        self.handler_export_selected = ExportSelectedFunctionsHandler()  # ty:ignore[missing-argument]
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_selected",
             "Export Selected Functions Assembly",
-            self.handler_export_selected,
+            self.handler_export_selected,  # ty:ignore[too-many-positional-arguments]
             None,  # No shortcut
             "Export selected functions to assembly files",
         )
         ida_kernwin.register_action(action_desc)
 
         # Selected functions pseudocode export action
-        self.handler_export_selected_pseudocode = ExportSelectedFunctionsPseudocodeHandler()
+        self.handler_export_selected_pseudocode = ExportSelectedFunctionsPseudocodeHandler()  # ty:ignore[missing-argument]
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_selected_pseudocode",
             "Export Selected Functions Pseudocode",
-            self.handler_export_selected_pseudocode,
+            self.handler_export_selected_pseudocode,  # ty:ignore[too-many-positional-arguments]
             None,  # No shortcut
             "Export selected functions to pseudocode files",
         )
         ida_kernwin.register_action(action_desc)
 
         # Recursive function export action
-        self.handler_export_recursive = ExportRecursiveFunctionHandler()
+        self.handler_export_recursive = ExportRecursiveFunctionHandler()  # ty:ignore[missing-argument]
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_recursive",
             "Export Recursive Function Assembly",
-            self.handler_export_recursive,
+            self.handler_export_recursive,  # ty:ignore[too-many-positional-arguments]
             None,  # No shortcut
             "Export the current function and its sub-calls recursively to assembly files",
         )
         ida_kernwin.register_action(action_desc)
 
         # Recursive function pseudocode export action
-        self.handler_export_recursive_pseudocode = ExportRecursiveFunctionPseudocodeHandler()
+        self.handler_export_recursive_pseudocode = ExportRecursiveFunctionPseudocodeHandler()  # ty:ignore[missing-argument]
         action_desc = ida_kernwin.action_desc_t(
             "assemport:export_recursive_pseudocode",
             "Export Recursive Function Pseudocode",
-            self.handler_export_recursive_pseudocode,
+            self.handler_export_recursive_pseudocode,  # ty:ignore[too-many-positional-arguments]
             None,  # No shortcut
             "Export the current function and its sub-calls recursively to pseudocode files",
         )
@@ -1162,13 +1189,14 @@ class Assemport(ida_idaapi.plugmod_t):
             ui_hooks = None
 
     def run(self, arg):
-        skip_named = get_skip_named_func_setting()
+        skip_named_func = get_skip_named_func_setting()
         dedupe = get_dedupe_setting()
         skip_code_refs = get_skip_code_refs_setting()
         skip_data_refs = get_skip_data_refs_setting()
         skip_named_data = get_skip_named_data_setting()
         merge_output = get_merge_output_setting()
-        f = AssemportSettingsForm(skip_named, dedupe, skip_code_refs, skip_data_refs, skip_named_data, merge_output)
+        loose_data_len = get_loose_data_len_setting()
+        f = AssemportSettingsForm(skip_named_func, dedupe, skip_code_refs, skip_data_refs, skip_named_data, merge_output, loose_data_len)
         f.Compile()
         if f.Execute() == 1:
             new_skip_named_func = (f.cGroup.value & 1) != 0
@@ -1177,15 +1205,17 @@ class Assemport(ida_idaapi.plugmod_t):
             new_skip_code_refs = (f.cGroup.value & 8) != 0
             new_skip_data_refs = (f.cGroup.value & 16) != 0
             new_merge_output = (f.cGroup.value & 32) != 0
+            new_loose_data_len = max(0, int(f.iLooseDataLen.value or 0))
             set_skip_named_func_setting(new_skip_named_func)
             set_skip_named_data_setting(new_skip_named_data)
             set_dedupe_asm_setting(new_dedupe)
             set_skip_code_refs_setting(new_skip_code_refs)
             set_skip_data_refs_setting(new_skip_data_refs)
             set_merge_output_setting(new_merge_output)
+            set_loose_data_len_setting(new_loose_data_len)
             print(
                 f"[Assemport] Settings updated: Skip Named Func={new_skip_named_func}, Skip Named Data={new_skip_named_data}, "
                 f"Dedupe={new_dedupe}, Skip Code Refs={new_skip_code_refs}, Skip Data Refs={new_skip_data_refs}, "
-                f"Merge Output={new_merge_output}"
+                f"Merge Output={new_merge_output}, Max Unknown Data Explore Length={new_loose_data_len}"
             )
         f.Free()

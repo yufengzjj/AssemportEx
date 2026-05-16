@@ -35,6 +35,7 @@ Output is written to an `Assemport/` folder next to your IDB.
 | Skip Refs From Code | Don't follow operand refs (`ADR`,etc). Call/branch refs are still followed. |
 | Skip Refs From Data | Don't follow pointer refs inside data (vtables, jump tables, etc.). |
 | Merge Exported Functions Into One File | Recursive export writes every function into a single `.asm`/`.c` instead of one file per function. |
+| Max Unknown Data Explore Length | When following a ref that lands on unknown bytes, keep walking up to N bytes past the first item. `0` (default) disables extra exploration. |
 
 ## Credits
 Based on [Assemport](https://github.com/Bizarrus/Assemport) by [Bizarrus](https://github.com/Bizarrus). Enhanced for IDA 9.0+.
