@@ -359,7 +359,7 @@ def get_ref_from_insn(ea):
         return None
 
     mn = insn.get_canon_mnem()
-    if mn not in ("ADR", "ADRL"):
+    if mn not in ("ADR", "ADRL", "ADRP", "LDR"):
         return None
     for op in insn.ops:
         if op.type in (idaapi.o_mem, idaapi.o_imm, idaapi.o_far, idaapi.o_near):
