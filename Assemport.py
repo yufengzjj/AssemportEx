@@ -361,6 +361,9 @@ def get_ref_from_insn(ea):
     mn = insn.get_canon_mnem()
     if mn not in ("ADR", "ADRL", "ADRP", "LDR"):
         return None
+    if mn in ("ADRP", "LDR"):
+        for xref in idautils.XrefsFrom(ea, idaapi.XREF_DATA):
+            return xref.to
     for op in insn.ops:
         if op.type in (idaapi.o_mem, idaapi.o_imm, idaapi.o_far, idaapi.o_near):
             if op.addr != 0 and op.addr != idaapi.BADADDR:
