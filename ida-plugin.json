@@ -1,7 +1,7 @@
 {
     "IDAMetadataDescriptorVersion": 1,
     "plugin": {
-        "name":        "assemport++",
+        "name":        "assemportex",
         "entryPoint":  "main.py",
         "categories":  [ "disassembly-and-processor-modules", "other", "decompilation", "api-scripting-and-automation", "collaboration-and-productivity" ],
         "logoPath":    "Screenshots/Logo.png",

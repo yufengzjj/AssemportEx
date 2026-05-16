@@ -692,6 +692,7 @@ DEDUPE_TAG = "D"
 SKIP_CODE_REFS_TAG = "C"
 SKIP_DATA_REFS_TAG = "R"
 SKIP_NAMED_DATA_TAG = "N"
+MERGE_OUTPUT_TAG = "M"
 
 
 def get_skip_named_func_setting():
@@ -774,6 +775,22 @@ def set_skip_named_data_setting(value):
     node.hashset(SKIP_NAMED_DATA_TAG, b"\x01" if value else b"\x00")
 
 
+def get_merge_output_setting():
+    """Retrieve the 'merge exported functions into one file' setting from the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    if node.hashval(MERGE_OUTPUT_TAG):
+        val = node.hashval(MERGE_OUTPUT_TAG)
+        return val == b"\x01"
+    return False
+
+
+def set_merge_output_setting(value):
+    """Store the 'merge exported functions into one file' setting in the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    node.create(SETTINGS_NODE_NAME)
+    node.hashset(MERGE_OUTPUT_TAG, b"\x01" if value else b"\x00")
+
+
 def get_recursive_functions(start_ea, initial=True) -> list:
     """Get all functions called by start_ea recursively, excluding library functions"""
     to_export = list()
@@ -822,8 +839,10 @@ def get_recursive_functions(start_ea, initial=True) -> list:
 
 def export_recursive_functions(start_ea, mode="asm"):
     """Export a function and all its sub-calls recursively"""
+    global_processed_ranges = set() if get_dedupe_setting() else None
+    merge_output = get_merge_output_setting()
     ida_kernwin.show_wait_box("analyzing recursive calls...")
-
+    file = None
     try:
         funcs_to_export = get_recursive_functions(start_ea)
         if len(funcs_to_export) == 0:
@@ -838,8 +857,6 @@ def export_recursive_functions(start_ea, mode="asm"):
             pass
         exported_count = 0
         processed = set()
-        global_processed_ranges = set() if get_dedupe_setting() else None
-
         while len(funcs_to_export) > 0:
             ea = funcs_to_export.pop(0)
             if ea in processed:
@@ -850,41 +867,50 @@ def export_recursive_functions(start_ea, mode="asm"):
             if func is None or func.start_ea != ea:
                 continue
             func_name = ida_funcs.get_func_name(ea)
-
             ida_kernwin.replace_wait_box(f"exporting {exported_count + 1}/{len(funcs_to_export)}: {func_name}")
-
             if mode == "asm":
-                # Save Content
-                file = ida_fpro.qfile_t()  # ty:ignore[missing-argument]
                 filename = os.path.join(output, f"{re.sub(r'[<>:"/\\|?*]', '_', func_name)}.asm")
-
-                if file.open(filename, "wt"):
-                    try:
-                        unhide_func_and_export_asm(func, file, funcs_to_export, global_processed_ranges)
-                        processed.add(func.start_ea)
-                        exported_count += 1
-                    except Exception as e:
-                        print(f"export func:{ea:#x} error:{''.join(traceback.format_exception(e))}")
-                    finally:
+                try:
+                    if merge_output:
+                        if file is None:
+                            file = ida_fpro.qfile_t()  # ty:ignore[missing-argument]
+                            assert file.open(filename, "wt"), f"cannot open file:{filename}"
+                    else:
+                        file = ida_fpro.qfile_t()  # ty:ignore[missing-argument]
+                        assert file.open(filename, "wt"), f"cannot open file:{filename}"
+                    unhide_func_and_export_asm(func, file, funcs_to_export, global_processed_ranges)
+                    processed.add(func.start_ea)
+                    exported_count += 1
+                except Exception as e:
+                    print(f"export func:{ea:#x} error:{''.join(traceback.format_exception(e))}")
+                finally:
+                    if not merge_output and file:
                         file.close()
             elif mode == "c":
                 if not ida_hexrays.init_hexrays_plugin():
                     continue
+                filename = os.path.join(output, f"{re.sub(r'[<>:"/\\|?*]', '_', func_name)}.asm")
                 try:
+                    if merge_output:
+                        if file is None:
+                            file = open(filename, "w", encoding="utf-8")
+                    else:
+                        file = open(filename, "w", encoding="utf-8")
                     cfunc = ida_hexrays.decompile(ea)
                     if cfunc:
                         pseudocode = str(cfunc)
-                        filename = os.path.join(output, f"{func_name}.c")
-                        with open(filename, "w", encoding="utf-8") as f:
-                            f.write(pseudocode)
+                        file.write(pseudocode)
                         exported_count += 1
-                except:
-                    pass
+                finally:
+                    if not merge_output and file:
+                        file.close()
         ida_kernwin.info(f"recursively exported {exported_count}/{exported_count + len(funcs_to_export)} functions successfully!")
     except Exception as e:
         ida_kernwin.error(f"export func error:{''.join(traceback.format_exception(e))}")
     finally:
         ida_kernwin.hide_wait_box()
+        if merge_output and file:
+            file.close()
 
 
 def export_selected_functions_pseudocode(selection_indices):
@@ -1004,7 +1030,7 @@ ui_hooks = None
 
 
 class AssemportSettingsForm(ida_kernwin.Form):
-    def __init__(self, skip_named_func, dedupe, skip_code_refs, skip_data_refs, skip_named_data):
+    def __init__(self, skip_named_func, dedupe, skip_code_refs, skip_data_refs, skip_named_data, merge_output):
         form_str = r"""STARTITEM 0
 Assemport Settings
 
@@ -1012,16 +1038,18 @@ Assemport Settings
 <Skip Named Data:{rSkipNamedData}>
 <Global ASM/DATA Fragment Deduplication:{rDedupe}>
 <Skip Refs From Code:{rSkipCodeRefs}>
-<Skip Refs From Data:{rSkipDataRefs}>{cGroup}>
+<Skip Refs From Data:{rSkipDataRefs}>
+<Merge Exported Functions Into One File:{rMergeOutput}>{cGroup}>
 """
         controls = {
             "cGroup": ida_kernwin.Form.ChkGroupControl(
-                ["rSkipNamedFunc", "rSkipNamedData", "rDedupe", "rSkipCodeRefs", "rSkipDataRefs"],  # ty:ignore[invalid-argument-type]
+                ["rSkipNamedFunc", "rSkipNamedData", "rDedupe", "rSkipCodeRefs", "rSkipDataRefs", "rMergeOutput"],  # ty:ignore[invalid-argument-type]
                 value=(1 if skip_named_func else 0)
                 | (2 if skip_named_data else 0)
                 | (4 if dedupe else 0)
                 | (8 if skip_code_refs else 0)
-                | (16 if skip_data_refs else 0),
+                | (16 if skip_data_refs else 0)
+                | (32 if merge_output else 0),
             ),  # ty:ignore[missing-argument]
         }
         ida_kernwin.Form.__init__(self, form_str, controls)
@@ -1136,7 +1164,8 @@ class Assemport(ida_idaapi.plugmod_t):
         skip_code_refs = get_skip_code_refs_setting()
         skip_data_refs = get_skip_data_refs_setting()
         skip_named_data = get_skip_named_data_setting()
-        f = AssemportSettingsForm(skip_named, dedupe, skip_code_refs, skip_data_refs, skip_named_data)
+        merge_output = get_merge_output_setting()
+        f = AssemportSettingsForm(skip_named, dedupe, skip_code_refs, skip_data_refs, skip_named_data, merge_output)
         f.Compile()
         if f.Execute() == 1:
             new_skip_named_func = (f.cGroup.value & 1) != 0
@@ -1144,13 +1173,16 @@ class Assemport(ida_idaapi.plugmod_t):
             new_dedupe = (f.cGroup.value & 4) != 0
             new_skip_code_refs = (f.cGroup.value & 8) != 0
             new_skip_data_refs = (f.cGroup.value & 16) != 0
+            new_merge_output = (f.cGroup.value & 32) != 0
             set_skip_named_func_setting(new_skip_named_func)
             set_skip_named_data_setting(new_skip_named_data)
             set_dedupe_asm_setting(new_dedupe)
             set_skip_code_refs_setting(new_skip_code_refs)
             set_skip_data_refs_setting(new_skip_data_refs)
+            set_merge_output_setting(new_merge_output)
             print(
                 f"[Assemport] Settings updated: Skip Named Func={new_skip_named_func}, Skip Named Data={new_skip_named_data}, "
-                f"Dedupe={new_dedupe}, Skip Code Refs={new_skip_code_refs}, Skip Data Refs={new_skip_data_refs}"
+                f"Dedupe={new_dedupe}, Skip Code Refs={new_skip_code_refs}, Skip Data Refs={new_skip_data_refs}, "
+                f"Merge Output={new_merge_output}"
             )
         f.Free()
