@@ -1,6 +1,8 @@
 import os
 import re
+import sys
 import traceback
+import unicodedata
 
 import ida_bytes
 import ida_fpro
@@ -17,6 +19,107 @@ import ida_segment
 import ida_ua
 import idaapi
 import idautils
+
+_WIN_ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
+
+_WIN_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+    | {
+        "COM\u00b9",
+        "COM\u00b2",
+        "COM\u00b3",  # 上标 1/2/3,Win11 也保留
+        "LPT\u00b9",
+        "LPT\u00b2",
+        "LPT\u00b3",
+    }
+)
+_POSIX_ILLEGAL_CHARS = re.compile(r"[/\x00]")
+
+
+def sanitize_path(path, replacement="_", max_component_bytes=255):
+    path = os.fspath(path)
+    path = unicodedata.normalize("NFC", path)
+    if _WIN_ILLEGAL_CHARS.search(replacement) or _POSIX_ILLEGAL_CHARS.search(replacement):
+        raise ValueError(f"replacement {replacement!r} illegal")
+    drive, rest = os.path.splitdrive(path)
+    is_absolute = rest.startswith(("/", "\\"))
+    components = re.split(r"[/\\]+", rest)
+    cleaned_components = []
+    for comp in components:
+        if not comp:
+            continue
+        cleaned = _sanitize_component(comp, replacement, max_component_bytes)
+        if cleaned:
+            cleaned_components.append(cleaned)
+    sep = os.sep
+    body = sep.join(cleaned_components)
+
+    if drive:
+        result = drive + sep + body if body else drive + sep
+    elif is_absolute:
+        result = sep + body
+    else:
+        result = body
+
+    return _safe_path(result)
+
+
+def _safe_path(path):
+    path = os.fspath(path)
+    if sys.platform == "win32":
+        path = os.path.abspath(path)
+        if not path.startswith("\\\\?\\"):
+            if path.startswith("\\\\"):
+                path = "\\\\?\\UNC\\" + path[2:]
+            else:
+                path = "\\\\?\\" + path
+    return path
+
+
+def _sanitize_component(name, replacement, max_bytes):
+    name = _WIN_ILLEGAL_CHARS.sub(replacement, name)
+    name = _POSIX_ILLEGAL_CHARS.sub(replacement, name)
+    if name in (".", ".."):
+        return replacement * len(name)  # '.' -> '_', '..' -> '__'
+    name = name.rstrip(" .")
+    if not name:
+        return replacement
+    stem = name.split(".", 1)[0].upper()
+    if stem in _WIN_RESERVED_NAMES:
+        name = replacement + name  # 加前缀避开保留名
+    name = _truncate_to_bytes(name, max_bytes)
+    return name
+
+
+def _truncate_to_bytes(name, max_bytes, encoding="utf-8"):
+    if len(name.encode(encoding)) <= max_bytes:
+        return name
+    if "." in name:
+        stem, ext = name.rsplit(".", 1)
+        ext = "." + ext
+        ext_bytes = ext.encode(encoding)
+        if len(ext_bytes) > 32:
+            stem, ext = name, ""
+            ext_bytes = b""
+    else:
+        stem, ext = name, ""
+        ext_bytes = b""
+    budget = max_bytes - len(ext_bytes)
+    if budget <= 0:
+        return _truncate_bytes_safe(name, max_bytes, encoding)
+    stem_truncated = _truncate_bytes_safe(stem, budget, encoding)
+    return stem_truncated + ext
+
+
+def _truncate_bytes_safe(s, max_bytes, encoding="utf-8"):
+    encoded = s.encode(encoding)
+    if len(encoded) <= max_bytes:
+        return s
+    truncated = encoded[:max_bytes]
+    # 'ignore' 会丢弃末尾不完整的多字节序列
+    return truncated.decode(encoding, errors="ignore")
 
 
 # Action handlers for context menu
@@ -549,7 +652,7 @@ def export_single_function(func):
     try:
         # Get Working-Path
         path = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_CMD))
-        output = os.path.join(path, "Assemport")
+        output = sanitize_path(os.path.join(path, "Assemport"))
 
         # Create Output-Directory
         try:
@@ -568,7 +671,7 @@ def export_single_function(func):
 
         # Save Content
         file = ida_fpro.qfile_t()
-        filename = os.path.join(output, f"{re.sub(r'[<>:"/\\|?*]', '_', func_name)}.asm")
+        filename = sanitize_path(os.path.join(output, f"{func_name}.asm"))
 
         if file.open(filename, "wt"):
             try:
@@ -592,7 +695,7 @@ def export_selected_functions(selection_indices):
     try:
         # Get Working-Path
         path = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_CMD))
-        output = os.path.join(path, "Assemport")
+        output = sanitize_path(os.path.join(path, "Assemport"))
 
         # Create Output-Directory
         try:
@@ -623,7 +726,7 @@ def export_selected_functions(selection_indices):
                 func_name = ida_funcs.get_func_name(ea)
                 # Save Content
                 file = ida_fpro.qfile_t()
-                filename = os.path.join(output, f"{re.sub(r'[<>:"/\\|?*]', '_', func_name)}.asm")
+                filename = sanitize_path(os.path.join(output, f"{func_name}.asm"))
 
                 if file.open(filename, "wt"):
                     try:
@@ -649,7 +752,7 @@ def export_single_function_pseudocode(func):
 
         # Get Working-Path
         path = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_CMD))
-        output = os.path.join(path, "Assemport")
+        output = sanitize_path(os.path.join(path, "Assemport"))
 
         # Create Output-Directory
         try:
@@ -676,7 +779,7 @@ def export_single_function_pseudocode(func):
             pseudocode = str(cfunc)
 
             # Save pseudocode to file
-            filename = os.path.join(output, f"{func_name}.c")
+            filename = sanitize_path(os.path.join(output, f"{func_name}.c"))
 
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(pseudocode)
@@ -877,7 +980,7 @@ def export_recursive_functions(start_ea, mode="asm"):
             return
         ida_kernwin.replace_wait_box(f"exporting {len(funcs_to_export)} functions...")
         path = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_CMD))
-        output = os.path.join(path, "Assemport")
+        output = sanitize_path(os.path.join(path, "Assemport"))
         try:
             os.mkdir(output)
         except FileExistsError:
@@ -896,7 +999,7 @@ def export_recursive_functions(start_ea, mode="asm"):
             func_name = ida_funcs.get_func_name(ea)
             ida_kernwin.replace_wait_box(f"exporting {exported_count + 1}/{len(funcs_to_export)}: {func_name}")
             if mode == "asm":
-                filename = os.path.join(output, f"{re.sub(r'[<>:"/\\|?*]', '_', func_name)}.asm")
+                filename = sanitize_path(os.path.join(output, f"{func_name}.asm"))
                 try:
                     if merge_output:
                         if file is None:
@@ -952,7 +1055,7 @@ def export_selected_functions_pseudocode(selection_indices):
 
         # Get Working-Path
         path = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_CMD))
-        output = os.path.join(path, "Assemport")
+        output = sanitize_path(os.path.join(path, "Assemport"))
 
         # Create Output-Directory
         try:
@@ -992,7 +1095,7 @@ def export_selected_functions_pseudocode(selection_indices):
                     pseudocode = str(cfunc)
 
                     # Save pseudocode to file
-                    filename = os.path.join(output, f"{func_name}.c")
+                    filename = sanitize_path(os.path.join(output, f"{func_name}.c"))
 
                     with open(filename, "w", encoding="utf-8") as f:
                         f.write(pseudocode)
@@ -1007,49 +1110,6 @@ def export_selected_functions_pseudocode(selection_indices):
 
     finally:
         ida_kernwin.hide_wait_box()
-
-
-def export_function_assembly(func, ea):
-    """Helper function to get assembly code for a function"""
-    try:
-        # Create a temporary file to capture assembly output
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(mode="w+t", suffix=".asm", delete=False) as temp_file:
-            temp_filename = temp_file.name
-
-        # Generate assembly to temp file
-        file = ida_fpro.qfile_t()
-        if file.open(temp_filename, "wt"):
-            try:
-                unhide_func_and_export_asm(func, file)
-            finally:
-                file.close()
-
-        # Read the content back
-        try:
-            with open(temp_filename, "r", encoding="utf-8") as f:
-                content = f.read()
-            os.unlink(temp_filename)  # Clean up temp file
-            return content
-        except:
-            return None
-
-    except Exception as e:
-        print(f"[Assemport] Error getting assembly for function: {e}")
-        return None
-
-
-def export_function_pseudocode(func, ea):
-    """Helper function to get pseudocode for a function"""
-    try:
-        cfunc = ida_hexrays.decompile(ea)
-        if cfunc is None:
-            return None
-        return str(cfunc)
-    except Exception as e:
-        print(f"[Assemport] Error getting pseudocode for function: {e}")
-        return None
 
 
 # Global hooks instance
