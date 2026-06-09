@@ -31,6 +31,8 @@ Output is written to an `Assemport/` folder next to your IDB.
 |---|---|
 | Skip Named Func | Recursive export skips functions with custom names (keeps `sub_XXXX`). |
 | Skip Named Data | When following refs, skip data with custom names (assumed exported elsewhere). |
+| Skip Thunk Func | Recursive export skips all thunk functions (jump/import stubs), named or not. Off by default (only named thunks are skipped). |
+| Skip Lib Func | Recursive export skips functions flagged as library code (and doesn't recurse into them). On by default. |
 | Global ASM/DATA Fragment Deduplication | Deduplicates shared code/data fragments across recursive exports. |
 | Skip Refs From Code | Don't follow operand refs (`ADR`,etc). Call/branch refs are still followed. |
 | Skip Refs From Data | Don't follow pointer refs inside data (vtables, jump tables, etc.). |

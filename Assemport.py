@@ -10,6 +10,7 @@ import ida_funcs
 import ida_hexrays
 import ida_ida
 import ida_idaapi
+import ida_idp
 import ida_kernwin
 import ida_lines
 import ida_loader
@@ -17,6 +18,7 @@ import ida_name
 import ida_range
 import ida_segment
 import ida_ua
+import ida_xref
 import idaapi
 import idautils
 
@@ -134,25 +136,17 @@ class ExportSingleFunctionHandler(ida_kernwin.action_handler_t):
         else:
             ea = ida_kernwin.get_screen_ea()
 
-        func = ida_funcs.get_func(ea)
-
-        if func is None:
-            ida_kernwin.warning("No function at current address")
-            return 1
+        # Fall back to a synthetic function when IDA hasn't defined one here;
+        # unhide_func_and_export_asm reconstructs the range from control flow.
+        func = ida_funcs.get_func(ea) or _NoFunc(ea)
 
         # Export just this function
         export_single_function(func)
         return 1
 
     def update(self, ctx):
-        # Enable only if cursor is on a function
-        if hasattr(ctx, "cur_ea"):
-            ea = ctx.cur_ea
-        else:
-            ea = ida_kernwin.get_screen_ea()
-
-        func = ida_funcs.get_func(ea)
-        return ida_kernwin.AST_ENABLE if func else ida_kernwin.AST_DISABLE
+        # Always available in the disassembly view; works on undefined code too.
+        return ida_kernwin.AST_ENABLE
 
 
 def is_functions_window(ctx):
@@ -274,25 +268,18 @@ class ExportRecursiveFunctionHandler(ida_kernwin.action_handler_t):
         else:
             ea = ida_kernwin.get_screen_ea()
 
+        # Fall back to the raw address when IDA hasn't defined a function here;
+        # the recursive walk reconstructs undefined code from control flow.
         func = ida_funcs.get_func(ea)
-
-        if func is None:
-            ida_kernwin.warning("No function at current address")
-            return 1
+        start_ea = func.start_ea if func else ea
 
         # Export this function and all sub-calls recursively
-        export_recursive_functions(func.start_ea, "asm")
+        export_recursive_functions(start_ea, "asm")
         return 1
 
     def update(self, ctx):
-        # Enable only if cursor is on a function
-        if hasattr(ctx, "cur_ea"):
-            ea = ctx.cur_ea
-        else:
-            ea = ida_kernwin.get_screen_ea()
-
-        func = ida_funcs.get_func(ea)
-        return ida_kernwin.AST_ENABLE if func else ida_kernwin.AST_DISABLE
+        # Always available in the disassembly view; works on undefined code too.
+        return ida_kernwin.AST_ENABLE
 
 
 class ExportRecursiveFunctionPseudocodeHandler(ida_kernwin.action_handler_t):
@@ -332,7 +319,7 @@ class AssemportUIHooks(ida_kernwin.UI_Hooks):
     def __init__(self):
         ida_kernwin.UI_Hooks.__init__(self)
 
-    def populating_widget_popup(self, widget, popup_handle, ctx):
+    def populating_widget_popup(self, widget, popup_handle, ctx):  # ty:ignore[invalid-method-override]
         # Add context menu items based on widget type
         if ctx is None:
             return
@@ -345,67 +332,37 @@ class AssemportUIHooks(ida_kernwin.UI_Hooks):
             else:
                 ea = ida_kernwin.get_screen_ea()
 
-            func = ida_funcs.get_func(ea)
-            if func:
-                ida_kernwin.attach_action_to_popup(widget, popup_handle, "assemport:export_single", None)
-                # Add recursive export action
-                ida_kernwin.attach_action_to_popup(widget, popup_handle, "assemport:export_recursive", None)
+            # ASM export works on any address: when IDA hasn't defined a
+            # function here, the export falls back to reconstruct_func_range,
+            # so always offer it in the disassembly view.
+            ida_kernwin.attach_action_to_popup(widget, popup_handle, "assemport:export_single", None)  # ty:ignore[invalid-argument-type]
+            # Add recursive export action
+            ida_kernwin.attach_action_to_popup(widget, popup_handle, "assemport:export_recursive", None)  # ty:ignore[invalid-argument-type]
 
-                # Add pseudocode export option if hexrays is available
-                if ida_hexrays.init_hexrays_plugin():
-                    ida_kernwin.attach_action_to_popup(widget, popup_handle, "assemport:export_single_pseudocode", None)
-                    # Add recursive pseudocode export action
-                    ida_kernwin.attach_action_to_popup(
-                        widget,
-                        popup_handle,
-                        "assemport:export_recursive_pseudocode",
-                        None,
-                    )
+            # Pseudocode export needs the decompiler AND a real function.
+            func = ida_funcs.get_func(ea)
+            if func and ida_hexrays.init_hexrays_plugin():
+                ida_kernwin.attach_action_to_popup(widget, popup_handle, "assemport:export_single_pseudocode", None)  # ty:ignore[invalid-argument-type]
+                # Add recursive pseudocode export action
+                ida_kernwin.attach_action_to_popup(
+                    widget,
+                    popup_handle,
+                    "assemport:export_recursive_pseudocode",
+                    None,  # ty:ignore[invalid-argument-type]
+                )
 
         # For Functions window - add selected functions export
         elif widget_type == ida_kernwin.BWN_FUNCS or (widget_type == ida_kernwin.BWN_CHOOSER and "Functions" in ida_kernwin.get_widget_title(widget)):
             if hasattr(ctx, "chooser_selection"):
-                ida_kernwin.attach_action_to_popup(widget, popup_handle, "assemport:export_selected", None)
+                ida_kernwin.attach_action_to_popup(widget, popup_handle, "assemport:export_selected", None)  # ty:ignore[invalid-argument-type]
                 # Add pseudocode export options if hexrays is available
                 if ida_hexrays.init_hexrays_plugin():
                     ida_kernwin.attach_action_to_popup(
                         widget,
                         popup_handle,
                         "assemport:export_selected_pseudocode",
-                        None,
+                        None,  # ty:ignore[invalid-argument-type]
                     )
-
-
-def get_loose_code_block_range(ea):
-    end_ea = ea
-    while True:
-        curr_flags = ida_bytes.get_flags(end_ea)
-        if end_ea == idaapi.BADADDR or not ida_bytes.is_code(curr_flags):
-            break
-        refs = [ref for ref in idautils.CodeRefsFrom(end_ea, True)]
-        if len(refs) == 0:
-            end_ea = ida_bytes.get_item_end(end_ea)
-            break
-        refs = [ref for ref in idautils.CodeRefsFrom(end_ea, False)]
-        if len(refs) > 0:
-            end_ea = ida_bytes.get_item_end(end_ea)
-            break
-        cur_func = ida_funcs.get_func(end_ea)
-        if cur_func:
-            if cur_func.start_ea <= end_ea < cur_func.end_ea:
-                end_ea = cur_func.end_ea
-                break
-            if cur_func.start_ea == end_ea:
-                break
-        cur_fchunk = ida_funcs.get_fchunk(end_ea)
-        if cur_fchunk:
-            if cur_fchunk.start_ea <= end_ea < cur_fchunk.end_ea:
-                end_ea = cur_fchunk.end_ea
-                break
-            if cur_fchunk.start_ea == end_ea:
-                break
-        end_ea = ida_bytes.get_item_end(end_ea)
-    return ida_range.range_t(ea, end_ea)
 
 
 def get_loose_data_range(ea, max_explore_len=0):
@@ -425,6 +382,15 @@ def get_loose_data_range(ea, max_explore_len=0):
     return ida_range.range_t(ea, end_ea)
 
 
+def _is_range_covered(existing, new_start: int, new_end: int) -> bool:
+    """True if any (start, end) pair in `existing` fully covers
+    [new_start, new_end) -- i.e. start <= new_start and new_end <= end."""
+    for s, e in existing:
+        if s <= new_start and new_end <= e:
+            return True
+    return False
+
+
 def check_func_range(ranges: list, ref: int, cur_func: ida_funcs.func_t, funcs_to_export: list | None, processed_ranges: set):
     """check the possible func range(or just a commom code chunk)"""
     func = ida_funcs.get_func(ref)
@@ -435,26 +401,32 @@ def check_func_range(ranges: list, ref: int, cur_func: ida_funcs.func_t, funcs_t
         else:
             if func.start_ea <= ref < func.end_ea:
                 r = ida_range.range_t(ref, func.end_ea)
-                if (ref, func.end_ea) not in processed_ranges and r not in ranges:
+                if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
                     ranges.append(r)
             else:
-                r = get_loose_code_block_range(ref)
-                if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
-                    ranges.append(r)
+                for s, e in reconstruct_func_range(ref):
+                    r = ida_range.range_t(s, e)
+                    if not _is_range_covered(processed_ranges, s, e):
+                        ranges.append(r)
     elif not func:
-        r = get_loose_code_block_range(ref)
-        if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
-            ranges.append(r)
+        for s, e in reconstruct_func_range(ref):
+            r = ida_range.range_t(s, e)
+            if not _is_range_covered(processed_ranges, s, e):
+                ranges.append(r)
 
 
 def check_c_ref_range(
     ranges: list, addr: int, cur_range: tuple[int, int], cur_func: ida_funcs.func_t, funcs_to_export: list | None, processed_ranges: set
 ):
     """check code ref at addr"""
-    for ref in idautils.CodeRefsFrom(addr, False):
-        if cur_range[0] <= ref < cur_range[1]:
+    for ref in idautils.XrefsFrom(addr, ida_xref.XREF_FAR):
+        if cur_range[0] <= ref.to < cur_range[1]:
             continue
-        check_func_range(ranges, ref, cur_func, funcs_to_export, processed_ranges)
+        if ref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+            if funcs_to_export is not None:
+                funcs_to_export.extend(get_recursive_functions(ref.to))
+            continue
+        check_func_range(ranges, ref.to, cur_func, funcs_to_export, processed_ranges)
 
 
 def get_ref_from_insn(ea):
@@ -497,18 +469,19 @@ def check_o_ref_range(
             continue
         o_flags = ida_bytes.get_flags(o_ref)
         if ida_bytes.is_code(o_flags):
-            check_func_range(ranges, o_ref, cur_func, funcs_to_export, processed_ranges)
+            if funcs_to_export is not None:
+                funcs_to_export.extend(get_recursive_functions(o_ref))
         elif ida_bytes.is_data(o_flags):
             if skip_named_data and ida_bytes.has_name(o_flags):
                 continue
             r = ida_range.range_t(o_ref, o_ref + ida_bytes.get_item_size(o_ref))
-            if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+            if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
                 ranges.append(r)
         else:
             if skip_named_data and ida_bytes.has_name(o_flags):
                 continue
             r = get_loose_data_range(o_ref, max_explore_len)
-            if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+            if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
                 ranges.append(r)
 
 
@@ -541,10 +514,11 @@ def check_d_ref_range(
                 ):
                     flags = ida_bytes.get_flags(ptr)
                     if ida_bytes.is_code(flags):
-                        check_func_range(ranges, ptr, cur_func, funcs_to_export, processed_ranges)
+                        if funcs_to_export is not None:
+                            funcs_to_export.extend(get_recursive_functions(ptr))
                     elif not (skip_named_data and ida_bytes.has_name(flags)):
                         r = get_loose_data_range(ptr, max_explore_len)
-                        if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+                        if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
                             ranges.append(r)
         ea = next_ea
 
@@ -571,7 +545,7 @@ def check_hidden_range(start: int, end: int, hidden_ranges: list):
         curr_ea = hr.end_ea  # Move to end of deleted range
 
 
-def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: list | None = None, processed_ranges: set | None = None):
+def unhide_func_and_export_asm(func, file, funcs_to_export: list | None = None, processed_ranges: set | None = None):
     """Temporarily unhide function and its chunks, then export to ASM"""
     hidden_funcs = []
     if func.flags & ida_funcs.FUNC_HIDDEN:
@@ -582,17 +556,25 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
     skip_data_refs = get_skip_data_refs_setting()
     skip_named_data = get_skip_named_data_setting()
     max_explore_len = get_loose_data_len_setting()
+    processed_ranges = set() if processed_ranges is None else processed_ranges
     try:
-        ranges = ida_range.rangeset_t()  # ty:ignore[missing-argument]
-        ida_funcs.get_func_ranges(ranges, func)
-        all_ranges = [ranges.getrange(i) for i in range(ranges.nranges())]
+        all_ranges = []
+        if func.end_ea == ida_idaapi.BADADDR:
+            for s, e in reconstruct_func_range(func.start_ea):
+                if not _is_range_covered(processed_ranges, s, e):
+                    all_ranges.append(ida_range.range_t(s, e))
+        else:
+            ranges = ida_range.rangeset_t()  # ty:ignore[missing-argument]
+            ida_funcs.get_func_ranges(ranges, func)
+            all_ranges = [ranges.getrange(i) for i in range(ranges.nranges())]
         all_ranges.sort(key=lambda r: (0 if r.start_ea == func.start_ea else 1, r.start_ea))
-        processed_ranges = set() if processed_ranges is None else processed_ranges
         data_ranges = []
         hidden_ranges = []
         while len(all_ranges) > 0:
             r = all_ranges.pop(0)
             start, end = r.start_ea, r.end_ea
+            if _is_range_covered(processed_ranges, start, end):
+                continue
             if start >= end:
                 continue
             check_hidden_range(start, end, hidden_ranges)
@@ -603,13 +585,14 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
                 ida_funcs.update_func(f)
             flags = ida_bytes.get_flags(start)
             if ida_bytes.is_code(flags):
-                if start >= func.start_ea and end <= func.end_ea:
+                if start >= func.start_ea and end <= func.end_ea and func.end_ea != idaapi.BADADDR:
                     ida_loader.gen_file(ida_loader.OFILE_ASM, file.get_fp(), start, end, 0)
                     check_c_ref_range(all_ranges, ida_bytes.prev_head(end, start), (start, end), func, funcs_to_export, processed_ranges)
                 else:
-                    r_name = ida_name.get_name(start)
-                    ida_fpro._ida_fpro.qfile_t_write(file, f"{r_name}\n")  # ty:ignore[unresolved-attribute]
                     for head in idautils.Heads(start, end):
+                        r_name = ida_name.get_name(head)
+                        if r_name:
+                            ida_fpro._ida_fpro.qfile_t_write(file, f"{r_name}\n")  # ty:ignore[unresolved-attribute]
                         disasm = ida_lines.generate_disasm_line(head, ida_lines.GENDSM_REMOVE_TAGS | ida_lines.GENDSM_MULTI_LINE)
                         ida_fpro._ida_fpro.qfile_t_write(file, f"{ida_lines.tag_remove(disasm)}\n")  # ty:ignore[unresolved-attribute]
                         check_c_ref_range(all_ranges, head, (start, end), func, funcs_to_export, processed_ranges)
@@ -645,6 +628,15 @@ def unhide_func_and_export_asm(func: ida_funcs.func_t, file, funcs_to_export: li
             ida_bytes.add_hidden_range(*hr)
 
 
+def get_export_name(ea):
+    """Name used for the output file/title. Falls back to the address label or
+    a synthetic loc_XXXX when IDA has no function/name at `ea`."""
+    name = ida_funcs.get_func_name(ea) or ida_name.get_name(ea)
+    if not name:
+        name = f"loc_{ea:X}"
+    return name
+
+
 def export_single_function(func):
     """Export a single function to assembly file"""
     ida_kernwin.show_wait_box("Exporting function...")
@@ -666,11 +658,11 @@ def export_single_function(func):
             print(f"[Assemport] An error occurred: {e}")
             return
 
-        # Get function name
-        func_name = ida_funcs.get_func_name(func.start_ea)
+        # Get function name (falls back for undefined code)
+        func_name = get_export_name(func.start_ea)
 
         # Save Content
-        file = ida_fpro.qfile_t()
+        file = ida_fpro.qfile_t()  # ty:ignore[missing-argument]
         filename = sanitize_path(os.path.join(output, f"{func_name}.asm"))
 
         if file.open(filename, "wt"):
@@ -725,7 +717,7 @@ def export_selected_functions(selection_indices):
                 # Get function name
                 func_name = ida_funcs.get_func_name(ea)
                 # Save Content
-                file = ida_fpro.qfile_t()
+                file = ida_fpro.qfile_t()  # ty:ignore[missing-argument]
                 filename = sanitize_path(os.path.join(output, f"{func_name}.asm"))
 
                 if file.open(filename, "wt"):
@@ -804,6 +796,8 @@ SKIP_DATA_REFS_TAG = "R"
 SKIP_NAMED_DATA_TAG = "N"
 MERGE_OUTPUT_TAG = "M"
 LOOSE_DATA_LEN_TAG = "L"
+SKIP_THUNK_TAG = "T"
+SKIP_LIB_TAG = "B"
 
 
 def get_skip_named_func_setting():
@@ -921,6 +915,120 @@ def set_loose_data_len_setting(value):
     node.hashset(LOOSE_DATA_LEN_TAG, str(max(0, int(value))).encode())
 
 
+def get_skip_thunk_setting():
+    """Retrieve the 'skip thunk functions' setting from the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    if node.hashval(SKIP_THUNK_TAG):
+        val = node.hashval(SKIP_THUNK_TAG)
+        return val == b"\x01"
+    return False
+
+
+def set_skip_thunk_setting(value):
+    """Store the 'skip thunk functions' setting in the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    node.create(SETTINGS_NODE_NAME)
+    node.hashset(SKIP_THUNK_TAG, b"\x01" if value else b"\x00")
+
+
+def get_skip_lib_setting():
+    """Retrieve the 'skip library functions' setting from the IDB netnode.
+    Defaults to True to preserve the historical always-skip behavior."""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    if node.hashval(SKIP_LIB_TAG):
+        val = node.hashval(SKIP_LIB_TAG)
+        return val == b"\x01"
+    return True
+
+
+def set_skip_lib_setting(value):
+    """Store the 'skip library functions' setting in the IDB netnode"""
+    node = idaapi.netnode(SETTINGS_NODE_NAME)  # ty:ignore[missing-argument]
+    node.create(SETTINGS_NODE_NAME)
+    node.hashset(SKIP_LIB_TAG, b"\x01" if value else b"\x00")
+
+
+class _NoFunc:
+    """Sentinel passed as `cur_func` when scanning a range that is not inside a
+    function. Only `.start_ea` is read by the check_* helpers; BADADDR never
+    matches a real function start, so nothing is wrongly skipped."""
+
+    def __init__(self, start_ea: ida_idaapi.ea_t = idaapi.BADADDR):
+        self.start_ea = start_ea
+        self.end_ea = idaapi.BADADDR
+        self.flags = 0
+
+
+_NO_FUNC = _NoFunc()
+
+
+def _merge_code_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge per-instruction intervals into contiguous code runs.leave gaps as it is"""
+    if not intervals:
+        return []
+    intervals.sort()
+    merged = []
+    cs, ce = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= ce:  # contiguous / overlapping instructions
+            ce = max(ce, e)
+        else:
+            merged.append((cs, ce))
+            cs, ce = s, e
+    merged.append((cs, ce))
+    return merged
+
+
+def reconstruct_func_range(start_ea) -> list[tuple[int, int]]:
+    """Best-effort reconstruction of a function's extent when IDA has NOT
+    defined a function at `start_ea` -- e.g. a control-flow-flattened or
+    obfuscated routine that has data (jump tables / inline constants) embedded
+    between its code blocks, which makes IDA refuse to create a function.
+
+    Floods intra-procedural control flow from `start_ea`: follows fall-through
+    and local jump targets, but NOT calls (BL/CALL target other functions) and
+    does not cross into a different already-defined function (tail calls).
+
+    Returns a LIST of (start, end) ranges -- the reached code blocks, without
+    embedded pure-data gaps bridged."""
+    visited = set()
+    stack = [start_ea]
+    intervals = []
+
+    def _is_other_func_start(ea):
+        f = ida_funcs.get_func(ea)
+        return f is not None and f.start_ea == ea and f.start_ea != start_ea
+
+    while stack:
+        ea = stack.pop()
+        if ea == idaapi.BADADDR or ea in visited or not ida_bytes.is_mapped(ea):
+            continue
+        if not ida_bytes.is_code(ida_bytes.get_flags(ea)):
+            continue
+        insn = ida_ua.insn_t()  # ty:ignore[missing-argument]
+        size = ida_ua.decode_insn(insn, ea)
+        if size <= 0:
+            continue
+        visited.add(ea)
+        intervals.append((ea, ea + size))
+
+        # Follow jump targets that stay within this procedure. Skip calls and
+        # jumps that land on the start of another defined function (tail calls).
+        for xref in idautils.XrefsFrom(ea, ida_xref.XREF_FAR):
+            if xref.type in (ida_xref.fl_JN, ida_xref.fl_JF):
+                if not _is_other_func_start(xref.to):
+                    stack.append(xref.to)
+
+        # Fall through to the next instruction unless this one stops flow
+        # (RET, ...). Calls (BL) don't stop flow, so execution continues.
+        if not ida_idp.is_ret_insn(insn):
+            nxt = ea + size
+            if not _is_other_func_start(nxt):
+                stack.append(nxt)
+
+    return _merge_code_intervals(intervals)
+
+
 def get_recursive_functions(start_ea, initial=True) -> list:
     """Get all functions called by start_ea recursively, excluding library functions"""
     to_export = list()
@@ -928,10 +1036,12 @@ def get_recursive_functions(start_ea, initial=True) -> list:
 
     # Get the current setting from IDB
     skip_named = get_skip_named_func_setting()
+    skip_thunk = get_skip_thunk_setting()
+    skip_lib = get_skip_lib_setting()
 
     while stack:
         ea = stack.pop(0)
-        func = ida_funcs.get_func(ea)
+        func = ida_funcs.get_func(ea) or _NoFunc(ea)
         if not func:
             continue
 
@@ -939,8 +1049,13 @@ def get_recursive_functions(start_ea, initial=True) -> list:
         if func_ea in to_export:
             continue
 
-        # Don't export library functions and don't recurse into them
-        if func.flags & ida_funcs.FUNC_LIB:
+        # When enabled, don't export library functions and don't recurse into them
+        if skip_lib and func.flags & ida_funcs.FUNC_LIB:
+            continue
+
+        # Thunks: skip all of them when the setting is on; otherwise only skip
+        # named thunks (likely import stubs).
+        if func.flags & ida_funcs.FUNC_THUNK and skip_thunk:
             continue
 
         # If setting is enabled, skip any function that doesn't have a default name
@@ -950,19 +1065,16 @@ def get_recursive_functions(start_ea, initial=True) -> list:
             if ida_bytes.has_name(flags):
                 continue
         initial = False
-        # Check if it's a thunk with a non-default name (likely an import stub)
-        if func.flags & ida_funcs.FUNC_THUNK:
-            flags = ida_bytes.get_flags(func_ea)
-            if ida_bytes.has_name(flags):
-                continue
 
         to_export.append(func_ea)
         # Find all calls from this function
         for head in idautils.FuncItems(func_ea):
-            for ref in idautils.CodeRefsFrom(head, False):
-                called_func = ida_funcs.get_func(ref)
+            for ref in idautils.XrefsFrom(head, ida_xref.XREF_FAR):
+                called_func = ida_funcs.get_func(ref.to)
                 if called_func and called_func.start_ea != func_ea:
                     stack.append(called_func.start_ea)
+                elif not called_func and ref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+                    to_export.append(ref.to)
 
     return to_export
 
@@ -993,10 +1105,10 @@ def export_recursive_functions(start_ea, mode="asm"):
                 continue
             if ida_kernwin.user_cancelled():
                 break
-            func = ida_funcs.get_func(ea)
+            func = ida_funcs.get_func(ea) or _NoFunc(ea)
             if func is None or func.start_ea != ea:
                 continue
-            func_name = ida_funcs.get_func_name(ea)
+            func_name = get_export_name(ea)
             ida_kernwin.replace_wait_box(f"exporting {exported_count + 1}/{len(funcs_to_export)}: {func_name}")
             if mode == "asm":
                 filename = sanitize_path(os.path.join(output, f"{func_name}.asm"))
@@ -1117,12 +1229,14 @@ ui_hooks = None
 
 
 class AssemportSettingsForm(ida_kernwin.Form):
-    def __init__(self, skip_named_func, dedupe, skip_code_refs, skip_data_refs, skip_named_data, merge_output, loose_data_len):
+    def __init__(self, skip_named_func, dedupe, skip_code_refs, skip_data_refs, skip_named_data, merge_output, loose_data_len, skip_thunk, skip_lib):
         form_str = r"""STARTITEM 0
 Assemport Settings
 
 <Skip Named Func:{rSkipNamedFunc}>
 <Skip Named Data:{rSkipNamedData}>
+<Skip Thunk Func:{rSkipThunk}>
+<Skip Lib Func:{rSkipLib}>
 <Global ASM/DATA Fragment Deduplication:{rDedupe}>
 <Skip Refs From Code:{rSkipCodeRefs}>
 <Skip Refs From Data:{rSkipDataRefs}>
@@ -1132,13 +1246,21 @@ Assemport Settings
 """
         controls = {
             "cGroup": ida_kernwin.Form.ChkGroupControl(
-                ["rSkipNamedFunc", "rSkipNamedData", "rDedupe", "rSkipCodeRefs", "rSkipDataRefs", "rMergeOutput"],  # ty:ignore[invalid-argument-type]
+                # IMPORTANT: each checkbox's bit follows the order the {rXxx}
+                # placeholders appear in form_str (bit = 1 << position). This
+                # list MUST be in that same order, and the value masks below plus
+                # the masks read in run() MUST agree with it. Order:
+                #   1 SkipNamedFunc, 2 SkipNamedData, 4 SkipThunk, 8 SkipLib,
+                #   16 Dedupe, 32 SkipCodeRefs, 64 SkipDataRefs, 128 MergeOutput
+                ["rSkipNamedFunc", "rSkipNamedData", "rSkipThunk", "rSkipLib", "rDedupe", "rSkipCodeRefs", "rSkipDataRefs", "rMergeOutput"],  # ty:ignore[invalid-argument-type]
                 value=(1 if skip_named_func else 0)
                 | (2 if skip_named_data else 0)
-                | (4 if dedupe else 0)
-                | (8 if skip_code_refs else 0)
-                | (16 if skip_data_refs else 0)
-                | (32 if merge_output else 0),
+                | (4 if skip_thunk else 0)
+                | (8 if skip_lib else 0)
+                | (16 if dedupe else 0)
+                | (32 if skip_code_refs else 0)
+                | (64 if skip_data_refs else 0)
+                | (128 if merge_output else 0),
             ),  # ty:ignore[missing-argument]
             "iLooseDataLen": ida_kernwin.Form.NumericInput(tp=ida_kernwin.Form.FT_DEC, value=loose_data_len),  # ty:ignore[missing-argument]
         }
@@ -1256,15 +1378,21 @@ class Assemport(ida_idaapi.plugmod_t):
         skip_named_data = get_skip_named_data_setting()
         merge_output = get_merge_output_setting()
         loose_data_len = get_loose_data_len_setting()
-        f = AssemportSettingsForm(skip_named_func, dedupe, skip_code_refs, skip_data_refs, skip_named_data, merge_output, loose_data_len)
+        skip_thunk = get_skip_thunk_setting()
+        skip_lib = get_skip_lib_setting()
+        f = AssemportSettingsForm(
+            skip_named_func, dedupe, skip_code_refs, skip_data_refs, skip_named_data, merge_output, loose_data_len, skip_thunk, skip_lib
+        )  # ty:ignore[too-many-positional-arguments]
         f.Compile()
         if f.Execute() == 1:
             new_skip_named_func = (f.cGroup.value & 1) != 0
             new_skip_named_data = (f.cGroup.value & 2) != 0
-            new_dedupe = (f.cGroup.value & 4) != 0
-            new_skip_code_refs = (f.cGroup.value & 8) != 0
-            new_skip_data_refs = (f.cGroup.value & 16) != 0
-            new_merge_output = (f.cGroup.value & 32) != 0
+            new_skip_thunk = (f.cGroup.value & 4) != 0
+            new_skip_lib = (f.cGroup.value & 8) != 0
+            new_dedupe = (f.cGroup.value & 16) != 0
+            new_skip_code_refs = (f.cGroup.value & 32) != 0
+            new_skip_data_refs = (f.cGroup.value & 64) != 0
+            new_merge_output = (f.cGroup.value & 128) != 0
             new_loose_data_len = max(0, int(f.iLooseDataLen.value or 0))
             set_skip_named_func_setting(new_skip_named_func)
             set_skip_named_data_setting(new_skip_named_data)
@@ -1272,10 +1400,12 @@ class Assemport(ida_idaapi.plugmod_t):
             set_skip_code_refs_setting(new_skip_code_refs)
             set_skip_data_refs_setting(new_skip_data_refs)
             set_merge_output_setting(new_merge_output)
+            set_skip_thunk_setting(new_skip_thunk)
+            set_skip_lib_setting(new_skip_lib)
             set_loose_data_len_setting(new_loose_data_len)
             print(
                 f"[Assemport] Settings updated: Skip Named Func={new_skip_named_func}, Skip Named Data={new_skip_named_data}, "
-                f"Dedupe={new_dedupe}, Skip Code Refs={new_skip_code_refs}, Skip Data Refs={new_skip_data_refs}, "
-                f"Merge Output={new_merge_output}, Max Unknown Data Explore Length={new_loose_data_len}"
+                f"Skip Thunk={new_skip_thunk}, Skip Lib={new_skip_lib}, Dedupe={new_dedupe}, Skip Code Refs={new_skip_code_refs}, "
+                f"Skip Data Refs={new_skip_data_refs}, Merge Output={new_merge_output}, Max Unknown Data Explore Length={new_loose_data_len}"
             )
         f.Free()
