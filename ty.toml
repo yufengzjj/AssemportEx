@@ -1,0 +1,3 @@
+[environment]
+# IDA 加载的是 Python 3.12（注册表 Python3TargetDLL）
+python-version = "3.12"
